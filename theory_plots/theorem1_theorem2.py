@@ -28,6 +28,7 @@ import networkx as nx
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import breadth_first_order, dijkstra
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 from matplotlib.lines import Line2D
 
 try:
@@ -130,12 +131,12 @@ class DeBruijn_DAG:
 
 		# all De Bruijn successors of node value v are v//V + b*V^(n-1), b in [0, V).
 		# Scan one branch character b at a time to keep peak memory at O(M) rather
-		# than O(M*V) -- the (M, V) form is prohibitive for large V^n (e.g. n=5).
+		# than O(M*V).
 		Vp = V ** (n - 1)
 		base = np.arange(M) // V          # first n-1 chars shifted, shared by all b
 		not_sink_u = ~self.is_sink
 		is_source = self.is_source
-		eu_parts, ev_parts = [], []
+		eu_parts, ev_parts = [], [] # parts of the edge arrays eu -> ev
 		for b in range(V):
 			ev_b = base + b * Vp          # successor value when appending char b
 			keep_b = not_sink_u & (pos < pos[ev_b]) & (~is_source[ev_b])
@@ -148,7 +149,7 @@ class DeBruijn_DAG:
 
 		# prune nodes not on any source-to-sink path: a node survives iff it is
 		# reachable from a source (forward BFS) AND it reaches a sink (backward BFS)
-		s_star, t_star = M, M + 1
+		s_star, t_star = M, M + 1 # fake super-source and super-sink node
 		src_vals = self.pi_all[:self.S]
 		snk_vals = self.pi_all[M - self.N:]
 		rows = np.concatenate([eu, np.full(self.S, s_star), snk_vals])
@@ -1035,8 +1036,56 @@ def _legend(ax, keys):
 	leg._legend_box.align = 'left'
 
 
+def _theory_insets(ax, results, keys, ds_key, theory_key, yb=0.06):
+	"""
+	Add one small zoomed inset per n, arranged left / middle / right (for the three
+	keys) in the axes' open space. Each inset is a log-y zoom of that n's theory
+	bound (dotted) and digit-sum ordering value (dashed) over the tail where the
+	theory line has dropped below yb; the dashed curve staying under the dotted one
+	shows the digit-sum ordering satisfies the Theorem 1 bound. indicate_inset draws
+	a box on the main axes marking the region each inset magnifies, with connectors.
+	"""
+	# [x0, y0, w, h] in axes fraction: left / middle / right for keys[0..2]
+	positions = [[0.05, 0.70, 0.17, 0.15],
+				 [0.36, 0.20, 0.17, 0.15],
+				 [0.69, 0.54, 0.17, 0.15]]
+	for i, k in enumerate(keys):
+		rows = results[k]
+		Vn = np.array([r['Vn'] for r in rows], dtype=float)
+		ds = np.array([r[ds_key] for r in rows])
+		th = np.array([r[theory_key] for r in rows])
+		col = CURVE_COLORS[i]
+		below = np.nonzero(th < yb)[0]
+		if len(below) == 0:
+			continue
+		# window: from the knee (theory < yb) to ~one decade past it, so the marked
+		# source box stays compact instead of spanning the whole tail
+		x0 = Vn[below[0]]
+		x1 = min(Vn[-1], x0 * 6.0)
+		sel = (Vn >= x0) & (Vn <= x1)
+
+		axin = ax.inset_axes(positions[min(i, len(positions) - 1)])
+		axin.plot(Vn[sel], th[sel], color=col, ls=THEORY_LS, lw=1.0)
+		axin.plot(Vn[sel], ds[sel], color=col, ls=DIGITSUM_LS, lw=1.0)
+		axin.set_xscale('log')
+		axin.set_yscale('log')
+		axin.set_xlim(x0, x1)
+		axin.set_ylim(max(ds[sel].min() * 0.3, 1e-300), yb)
+		for axis in (axin.xaxis, axin.yaxis):
+			axis.set_major_locator(mticker.NullLocator())
+			axis.set_minor_locator(mticker.NullLocator())
+		for s in ('top', 'right'):
+			axin.spines[s].set_visible(False)
+		# mark the region of the main plot this inset magnifies + connectors
+		_, connects = ax.indicate_inset([x0, 0.0, x1 - x0, yb], inset_ax=axin,
+										edgecolor=col, alpha=0.5, lw=0.7)
+		# keep only the connectors meeting the inset's two bottom corners
+		for c in connects:
+			c.set_visible(c.xy2[1] == 0)
+
+
 def _plot_ratio(results, keys, mean_key, lo_key, hi_key, ds_key, theory_key,
-				ylabel, outpath, log_y=False, show_legend=True):
+				ylabel, outpath, log_y=False, show_legend=True, show_insets=False):
 	"""
 	Plot vs V^n (log x) of three quantities per n: the random-permutation mean
 	(solid line + marker, with a shaded band from lo_key to hi_key), the digit-sum
@@ -1070,6 +1119,8 @@ def _plot_ratio(results, keys, mean_key, lo_key, hi_key, ds_key, theory_key,
 	_style_axis(ax)
 	if show_legend:
 		_legend(ax, keys)
+	if show_insets:
+		_theory_insets(ax, results, keys, ds_key, theory_key)
 	fig.savefig(outpath + '.pdf', bbox_inches='tight')
 	fig.savefig(outpath + '.png', bbox_inches='tight', dpi=300)
 	plt.close(fig)
@@ -1079,10 +1130,11 @@ def make_plots(results, outdir):
 	keys = sorted(results.keys())
 	figdir = os.path.join(outdir, 'figures')
 	os.makedirs(figdir, exist_ok=True)
-	# Plot 1: P_min / P_tot vs V^n (linear y), with the Theorem 1 bound
+	# Plot 1: P_min / P_tot vs V^n (linear y), Theorem 1 bound + left/middle/right insets
 	_plot_ratio(results, keys, 'path_ratio_mean', 'path_ratio_lo', 'path_ratio_hi',
 				'ds_path_ratio', 'theory1_ratio', r'$P_{\min}/P_{\mathrm{tot}}$',
-				os.path.join(figdir, 'theorem1_path_ratio'), log_y=False)
+				os.path.join(figdir, 'theorem1_path_ratio'), log_y=False,
+				show_insets=True)
 	# Plot 2: L_cover / L_max vs V^n (linear y), with the Theorem 2 bound (no legend)
 	_plot_ratio(results, keys, 'len_ratio_mean', 'len_ratio_lo', 'len_ratio_hi',
 				'ds_len_ratio', 'theory2_ratio', r'$L_{\mathrm{cover}}/L_{\mathrm{max}}$',
