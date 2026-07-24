@@ -1,43 +1,20 @@
 """
 Averaged over random permutations pi (with the digit-sum bound as reference):
-1. Plot min paths to cover/total paths while increasing $V^n$ s.t. $\\log_2(V)/n=c$ is fixed.
-	Plot curves for multiple values of $c$. Include the theoretical bound from theorem 1.
-2. Plot ratio of min_length_to_cover/max_length while increasing $V^n$ s.t. $\\log_2(V)/n=c$ is fixed.
-	Plot curves for multiple values of $c$. Include the theoretical bound from theorem 2.
+1. Plot min paths to cover/total paths while increasing $V^n$ s.t. $n$ is fixed.
+	Include the theoretical bound from theorem 1.
+2. Plot ratio of min_length_to_cover/max_length while increasing $V^n$ s.t. $n$ is fixed.
+	Include the theoretical bound from theorem 2.
 
 Notes
 -----
-- Each n gets three curves vs V^n, all on a linear y-axis (both ratios are in
-  [0, 1]): (i) the mean over n_trials random permutations pi (solid line + marker,
-  shaded +/- 1 std band); (ii) the single deterministic digit-sum ordering used in
-  the proofs (dashed); (iii) the digit-sum theorem bound (dotted). Color encodes n.
-- The digit-sum ordering (nodes sorted by digit sum, ties broken by the reversed-
-  string lexicographic comparison, which in our encoding is the node value
-  descending) is the ordering the theorems are proven for, so its curve sits at or
-  below the bound. A random ordering does not achieve it: for plot 1 the random
-  average stays well above the near-zero digit-sum curve -- the gap between "a
-  typical ordering" and "the optimal ordering".
-- Each curve holds the n-gram length n fixed and sweeps integer V; the point at
-  V is placed at V^n. Fixing n keeps the curves monotone (fixing log2(V)/n instead
-  makes n jump in integer steps, so those curves sawtooth). Along a fixed-n curve
-  the tightest reference m is constant, so the theory curve is smooth too.
-- Total path counts explode combinatorially (far beyond float64 range), so all
-  path counts are computed in log10-space.
-- The minimum number of paths covering every edge is computed exactly as a
-  minimum flow with a lower bound of 1 on every edge (two max-flow passes),
-  NOT with the degree-imbalance formula sum_v max(0, out-in), which is only an
-  upper bound (a cover path may traverse an edge that other cover paths also
-  need, so edges can carry flow > 1). Max-flow runs on a numba-compiled Dinic
-  implementation when numba is available (scipy 1.7's maximum_flow returns
-  wrong values on some instances, and networkx is too slow for the dense
-  digit-sum DAGs); networkx is kept as a fallback and as a cross-check in the
-  self tests.
-- We use constant S = 5 source and N = 10 sink nodes. The empirical average does
-  not depend on m; m only sets the reference theory bound. For each (V, n) point m
-  is the value giving the tightest theorem bounds: the smallest m with
-  S, N < C(n+m, m), subject to 0 < m < (V-1)/2. Both bounds tighten as m shrinks,
-  so the smallest feasible m is optimal for both. Points (V, n) that admit no such
-  m (V too small) have no theory reference and are skipped.
+- One curve for n=2,3,4. Dotted line is the theoretical bound, dashed line is the 
+	digit-sum ordering, and the full line is for random permutations.
+- The minimum number of paths to cover every edge is computed as a min flow with a 
+	lower bound of 1 on every edge (two max flow passes). We use numba's implementation.
+	networkx is used as a check.
+- We use constant S = 5 source and N = 10 sink nodes. 
+- For each (V, n) point m is the value giving the tightest theorem bounds: the smallest m with
+  S, N < C(n+m, m), subject to 0 < m < (V-1)/2.
 """
 
 import os
