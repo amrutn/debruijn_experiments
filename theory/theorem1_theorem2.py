@@ -1030,10 +1030,18 @@ def _legend(ax, keys):
 	# two vertical columns (column-major fill): left column = the n color key,
 	# right column = the random / digit-sum / theory style key
 	handles = color_handles + style_handles
-	leg = ax.legend(handles=handles, fontsize=LEGEND_FS, frameon=False, ncol=2,
-					loc='upper right', handlelength=1.4, columnspacing=0.8,
-					labelspacing=0.2, handletextpad=0.4)
+	leg = ax.legend(handles=handles, fontsize=LEGEND_FS, frameon=True, ncol=2,
+					loc='upper right', bbox_to_anchor=(1.0, 1.0), borderaxespad=0.15,
+					handlelength=1.4, columnspacing=0.8, labelspacing=0.2,
+					handletextpad=0.4)
 	leg._legend_box.align = 'left'
+	# boxed and drawn opaquely in front of the curves
+	leg.set_zorder(20)
+	frame = leg.get_frame()
+	frame.set_edgecolor('0.7')
+	frame.set_facecolor('white')
+	frame.set_alpha(1.0)
+	frame.set_linewidth(0.7)
 
 
 def _theory_insets(ax, results, keys, ds_key, theory_key, yb=0.06):
