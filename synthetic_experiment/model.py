@@ -60,13 +60,11 @@ class Linear(nn.Module):
 		if weights is None:
 			# sample weights according to a truncated Gaussian
 			std = math.sqrt(2/(self.din + self.dout))
-			weights = torch.empty(self.dout, self.din)
+			weights = torch.empty(self.dout, self.din).to(device=device, dtype=dtype)
 			nn.init.trunc_normal_(weights,
 								mean=0,
 								std=std, a=-3*std, b=3*std,
-								generator=self.rng,
-								dtype=dtype,
-								device=device)
+								generator=self.rng)
 
 		self.weights = nn.Parameter(weights).to(device=device, dtype=dtype)
 		assert self.weights.size() == (self.dout, self.din)
@@ -138,13 +136,11 @@ class Embedding(nn.Module):
 			assert weights.size() == (self.vocab_size, self.d_model)
 		else:
 			# initialize random weights
-			weights = torch.empty(self.vocab_size, self.d_model)
+			weights = torch.empty(self.vocab_size, self.d_model).to(device=device, dtype=dtype)
 			nn.init.trunc_normal_(weights,
 								mean=0,
 								std=1, a=-3, b=3,
-								generator=self.rng,
-								dtype=dtype,
-								device=device)
+								generator=self.rng)
 			self.weights = nn.Parameter(weights)
 
 	def forward(self, token_ids : torch.Tensor) -> torch.Tensor:
@@ -196,7 +192,7 @@ class RMSNorm(nn.Module):
 			self.weights = weights.to(dtype=self.dtype, device=self.device)
 			assert weights.size() == (d_model,)
 		else:
-			self.weights = torch.ones(self.d_model, dtype=self.dtype, device=torch.device)
+			self.weights = torch.ones(self.d_model, dtype=self.dtype, device=self.device)
 
 	def forward(self, x : torch.Tensor) -> torch.Tensor:
 		"""
@@ -261,7 +257,7 @@ class SwiGLU(nn.Module):
 
 		self.d_model = d_model
 		if d_ff is None:
-			d_ff = (8/3 * d_model * 64)//64 # nearest dim to a multiple of 64
+			d_ff = int((8/3 * d_model * 64)//64) # nearest dim to a multiple of 64
 		self.d_ff = d_ff
 		self.device = device
 		self.dtype = dtype
@@ -495,32 +491,26 @@ class MultiHead_Attention(nn.Module):
 		self.device=device
 		if W_Q is None:
 			std = math.sqrt(1/self.d_model)
-			W_Q = torch.empty(self.d_k * self.num_heads,self.d_model)
+			W_Q = torch.empty(self.d_k * self.num_heads,self.d_model).to(device=self.device, dtype=self.dtype)
 			nn.init.trunc_normal_(W_Q,
 								mean=0,
 								std=std, a=-2*std, b=2*std,
-								generator=self.rng,
-								dtype=self.dtype,
-								device=self.device)
+								generator=self.rng)
 		if W_K is None:
 			std = math.sqrt(1/self.d_model)
-			W_K = torch.empty(self.d_k * self.num_heads,self.d_model)
+			W_K = torch.empty(self.d_k * self.num_heads,self.d_model).to(device=self.device, dtype=self.dtype)
 			nn.init.trunc_normal_(W_K,
 								mean=0,
 								std=std, a=-2*std, b=2*std,
-								generator=self.rng,
-								dtype=self.dtype,
-								device=self.device)
+								generator=self.rng)
 
 		if W_V is None:
 			std = math.sqrt(1/self.d_model)
-			W_V = torch.empty(self.d_k * self.num_heads,self.d_model)
+			W_V = torch.empty(self.d_k * self.num_heads,self.d_model).to(device=self.device, dtype=self.dtype)
 			nn.init.trunc_normal_(W_V,
 								mean=0,
 								std=std, a=-2*std, b=2*std,
-								generator=self.rng,
-								dtype=self.dtype,
-								device=self.device)
+								generator=self.rng)
 
 		self.W_Q = nn.Parameter(W_Q).to(device=device, dtype=dtype)
 		self.W_K = nn.Parameter(W_K).to(device=device, dtype=dtype)
@@ -529,7 +519,8 @@ class MultiHead_Attention(nn.Module):
 		self.output_layer = Linear(self.d_k*self.num_heads,
 									 self.d_model, W_O,
 									 device=self.device,
-									 dtype=self.dtype)
+									 dtype=self.dtype,
+									 rng=self.rng)
 
 		# define the rope embedding to use
 		if use_rope:

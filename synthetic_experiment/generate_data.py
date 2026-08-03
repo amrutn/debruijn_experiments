@@ -3,6 +3,10 @@ Create data samples from a De Bruijn DAG of size (V,n) with
 random topological sort, or digit-sum ordering.
 """
 
+import os
+import sys
+import math
+
 import numpy as np
 
 # load the functions to create a de bruijn DAG from 
@@ -134,7 +138,7 @@ class ReasoningGenerator:
 		Returns
 		-------
 		chars : (num, T) int16
-			Character sequences, padded with -1. T = self.max_chars.
+			Character sequences, right-padded with -1. T = self.max_chars.
 		lengths : (num,) int32
 			Number of characters in each sample (n + path length).
 		"""
@@ -174,9 +178,119 @@ class ReasoningGenerator:
 		return chars, lengths
 
 
+	def sample_length_limited(self, num, L, rng):
+		"""
+		Sample `num` paths uniformly from the start-to-answer paths that use at
+		most `L` edges.
 
+		This is the length-restricted analogue of `sample`. That method weights
+		each path equally over *all* start-to-answer paths; here the support is
+		restricted to paths whose node sequence u_1 -> ... -> u_{k+1} has k <= L
+		edges (equivalently, a character string of length at most n + L), and
+		every such path is drawn with equal probability.
 
+		Params
+		------
+		num : int
+			Number of paths to draw.
+		L : int
+			Maximum number of edges (path length) allowed. Paths with strictly
+			more than `L` edges are excluded from the (uniform) support. For
+			"strictly shorter than L", pass ``L - 1``.
+		rng : numpy random generator
+			Source of randomness.
 
+		Returns
+		-------
+		chars : (num, n + L) int16
+			Character sequences, right-padded with -1.
+		lengths : (num,) int32
+			Number of characters in each sample (n + number of edges).
 
+		Raises
+		------
+		ValueError
+			If no start-to-answer path uses at most `L` edges.
+		"""
+		dag = self.dag
+		V, n = self.V, self.n
+		M = dag.num_nodes_all
+		Vp = V ** (n - 1)
+		is_sink = dag.is_sink
+		pi = dag.pi
+		Nn = len(pi)
 
+		# compact index for the alive nodes so the DP table stays O(num_nodes * L)
+		# rather than O(V^n * L)
+		comp = np.full(M, -1, dtype=np.int64)
+		comp[pi] = np.arange(Nn)
 
+		eu, ev = dag.edges_u, dag.edges_v
+		eb = (ev // Vp).astype(np.int64)            # character appended by each edge
+		ceu, cev = comp[eu], comp[ev]
+		sink_comp = comp[dag.sink_vals]
+		indptr, indices = dag._succ_indptr, dag._succ_indices
+
+		# reverse-topological DP: exact[v, k] = number of paths from v to an answer
+		# node using exactly k edges. Sinks contribute the single 0-edge path.
+		exact = np.zeros((Nn, L + 1), dtype=np.float64)
+		exact[sink_comp, 0] = 1.0
+		for v in pi[::-1]:
+			if is_sink[v]:
+				continue
+			succ = indices[indptr[v]:indptr[v + 1]]
+			if len(succ) == 0:
+				continue
+			cs = comp[succ]
+			# exact[v, k] = sum over successors w of exact[w, k-1]
+			exact[comp[v], 1:] = exact[cs, :L].sum(axis=0)
+
+		# cum[v, k] = number of paths from v to an answer using at most k edges
+		cum = np.cumsum(exact, axis=1)
+
+		# start distribution: proportional to the number of admissible paths below
+		# each start node
+		src_vals = dag.source_vals
+		start_w = cum[comp[src_vals], L]
+		total = start_w.sum()
+		if total <= 0:
+			raise ValueError(f"No start-to-answer path with at most L={L} edges")
+		start_p = start_w / total
+
+		T = n + L
+		chars = np.full((num, T), -1, dtype=np.int16)
+		lengths = np.full(num, n, dtype=np.int32)
+
+		node = rng.choice(src_vals, size=num, p=start_p).astype(np.int64)
+		# the first n characters spell out the start node (a_1 = least significant)
+		x = node.copy()
+		for k in range(n):
+			chars[:, k] = x % V
+			x //= V
+
+		active = np.arange(num)
+		for t in range(n, T):
+			# a path that has reached an answer node terminates here
+			active = active[~is_sink[node[active]]]
+			if len(active) == 0:
+				break
+
+			# edges remaining for the whole path, this edge included (L down to 1);
+			# weight each out-edge by the number of ways to finish within budget
+			rem = L - (t - n)
+			prob = np.zeros(len(eu), dtype=np.float64)
+			denom = cum[ceu, rem]
+			np.divide(cum[cev, rem - 1], denom, out=prob, where=denom > 0)
+			bp = np.zeros((M, V + 1), dtype=np.float64)
+			bp[eu, eb] = prob
+			bcum = np.cumsum(bp, axis=1)
+
+			u = node[active]
+			r = rng.random(len(active))
+			b = (bcum[u] < r[:, None]).sum(axis=1)
+			b = np.minimum(b, V - 1)                # active nodes are non-sinks, so no EOS
+			chars[active, t] = b.astype(np.int16)
+			node[active] = node[active] // V + b * Vp
+			lengths[active] = t + 1
+
+		return chars, lengths
