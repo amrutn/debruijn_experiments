@@ -1,0 +1,29 @@
+# Combined conda environment for the whole project:
+#   - theory/                (theorem1_theorem2.py, theorem3.py, debruijn_dag_figure.py)
+#   - synthetic_experiment/  (generate_data.py, model.py, train_eval.py, run_experiments.py)
+#
+# theory needs numpy / scipy / matplotlib / networkx / numba; the synthetic
+# experiment additionally needs torch and einx. torch and einx are installed
+# via pip so the platform-appropriate build is selected automatically -- CUDA
+# on the Linux cluster (the 2x4090 run), MPS on Apple Silicon.
+#
+# Create with:  conda env create -f environment.yml
+# Update with:  conda env update -f environment.yml --prune
+#
+# Tested (Apple Silicon / arm64) with: python 3.12.3, torch 2.13.0, numpy 2.4.6,
+# scipy 1.18.0, matplotlib 3.11.1, networkx 3.6.1, numba 0.66.0, einx 0.4.3.
+name: ngram-experiments
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy>=2.0
+  - scipy>=1.11
+  - matplotlib>=3.8
+  - networkx>=3.0
+  - numba>=0.60          # provides numpy>=2 compatibility; conda resolves a matching numpy
+  - tqdm>=4.60           # progress bars for run_experiments.py
+  - pip>=23
+  - pip:
+      - torch>=2.2       # CUDA build on Linux, MPS build on macOS
+      - einx>=0.4        # not packaged on conda-forge, so installed via pip

@@ -2,18 +2,18 @@
 Training and evaluation for the synthetic De Bruijn experiments.
 
 There is no "correct" continuation to predict -- the model has to learn which
-subset of the vocabulary is legal at each state. The metrics are therefore
-support metrics rather than accuracy:
+subset of the vocabulary is legal at each state. The metric is therefore a
+support metric rather than accuracy:
 
 illegal_mass      total probability the model puts on tokens that are not edges
                   of D_pi. This is the direct empirical analogue of "has it
                   learned the edge set", is well defined at every branch point
                   regardless of out-degree, and is reported split by whether the
                   state was visited during training.
-edge_recall       fraction of legal transitions the model actually assigns
-                  non-negligible probability to, split into transitions seen /
-                  never seen in training. Catches a model that has merely
-                  memorised the training paths.
+
+path_coverage     What proportion of correct paths does the model assign non-trivial
+				  probability to. A path counts as "covered" if the model assigns
+				  P_model(path) >= PATH_RATIO*P_true(path)
 
 Two experiments are provided:
 
@@ -50,10 +50,8 @@ from generate_data import build_dag, ReasoningGenerator
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cache')
 
-# Threshold for the edge_recall function
-# a legal transition counts as "recalled" if the model puts at least this much
-# probability on it. "non-negligible" in the sense of the module docstring.
-DEFAULT_RECALL_THRESH = 1e-2
+# The default path ratio when computing the path_coverage metric
+DEFAULT_PATH_RATIO = 0.1
 
 
 @dataclass
@@ -367,7 +365,7 @@ def build_legal(dag):
 
 def training_visits(chars, lengths, dag):
 	"""
-	Which states and transitions the training set actually covered.
+	Which states the training set actually visited.
 
 	Params
 	------
@@ -382,14 +380,10 @@ def training_visits(chars, lengths, dag):
 	-------
 	seen_states : (V^n,) bool
 		seen_states[u] is True iff some training path visited node u.
-	seen_edges : (V^n, V+1) bool
-		seen_edges[u, b] is True iff some training path took transition b out of
-		node u (b == V is the EOS transition of a sink).
 	"""
 	V, n = dag.V, dag.n
 	M = dag.num_nodes_all
 	seen_states = np.zeros(M, dtype=bool)
-	seen_edges = np.zeros((M, V + 1), dtype=bool)
 
 	num, T = chars.shape
 	node_at = _node_values(chars, n, V)
@@ -397,15 +391,8 @@ def training_visits(chars, lengths, dag):
 	# prediction states are windows ending at i in [n-1, l-1]
 	valid = (idx[None, :] >= n - 1) & (idx[None, :] <= (lengths[:, None] - 1))
 	rows, cols = np.where(valid)
-	u = node_at[rows, cols]
-	seen_states[u] = True
-
-	j = cols + 1                                 # index of the token being produced
-	is_eos = j == lengths[rows]                  # sink -> EOS transition
-	branch = ~is_eos
-	seen_edges[u[branch], chars[rows[branch], j[branch]]] = True
-	seen_edges[u[is_eos], V] = True
-	return seen_states, seen_edges
+	seen_states[node_at[rows, cols]] = True
+	return seen_states
 
 
 # ----------------------------------------------------------------------------
@@ -482,10 +469,10 @@ def train_one_epoch(model, full_tokens, lengths, n, tcfg):
 
 @torch.no_grad()
 def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
-			 recall_thresh=DEFAULT_RECALL_THRESH, seen_states=None, seen_edges=None,
+			 seen_states=None, true_branch_p=None, path_ratio=DEFAULT_PATH_RATIO,
 			 device=None, batch_size=512):
 	"""
-	Compute illegal_mass and edge_recall on a test set.
+	Compute illegal_mass (and optionally path_coverage) on a test set.
 
 	`orig_chars`/`lengths` are the *unpermuted* samples (they define the states
 	and legal transitions). If `perms` is given, the model is fed the permuted
@@ -493,15 +480,17 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 	identities before scoring -- the metrics are therefore invariant to the
 	relabelling and comparable across experiments.
 
-	When `seen_states`/`seen_edges` are supplied, each metric is additionally
-	split by whether the state / transition was covered in training.
+	When `seen_states` is supplied, illegal_mass is additionally split by whether
+	the state was visited in training. When `true_branch_p` is supplied,
+	path_coverage is also computed.
 
 	Params
 	------
 	model : model.TransformerLM
 		Trained (or untrained, for a baseline) model to score.
 	orig_chars : (num, T) int array
-		Original, unpermuted test character sequences.
+		Original, unpermuted test character sequences, drawn from the true path
+		distribution (`ReasoningGenerator.sample`).
 	lengths : (num,) int array
 		Number of characters in each test sample.
 	dag : DeBruijn_DAG
@@ -510,15 +499,15 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 		Per-block token permutations (experiment 1); None means no relabelling.
 	bin_width : int | None
 		Block width for `perms`; required when `perms` is given.
-	recall_thresh : float
-		A legal transition counts as recalled if the model assigns it at least
-		this probability.
 	seen_states : (V^n,) bool | None
 		Training state coverage from `training_visits`; enables the seen/unseen
 		split of illegal_mass.
-	seen_edges : (V^n, V+1) bool | None
-		Training transition coverage; enables the seen/unseen split of
-		edge_recall.
+	true_branch_p : (V^n, V+1) float | None
+		The generator's true next-token distribution per node
+		(`ReasoningGenerator.branch_p`). When given, path_coverage is reported.
+	path_ratio : float
+		A path counts as covered if the model assigns it at least this fraction
+		of its true probability (see DEFAULT_PATH_RATIO).
 	device : str | torch.device | None
 		Device to run the model on; None auto-selects (see `resolve_device`).
 	batch_size : int
@@ -530,18 +519,19 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 		Always present:
 		- 'illegal_mass' : float
 			Mean probability on illegal tokens, averaged over prediction states.
-		- 'edge_recall' : float
-			Fraction of legal-transition instances given prob >= recall_thresh.
 		- 'num_states' : int
 			Number of prediction states scored.
 		- 'num_legal' : int
 			Number of legal-transition instances scored.
-		Present only when the corresponding coverage is passed (nan for an empty
-		group):
+		Present only when `seen_states` is passed (nan for an empty group):
 		- 'illegal_mass_seen' / 'illegal_mass_unseen' : float
 			illegal_mass split by whether the state was seen in training.
-		- 'edge_recall_seen' / 'edge_recall_unseen' : float
-			edge_recall split by whether the transition was seen in training.
+		Present only when `true_branch_p` is passed:
+		- 'path_coverage' : float
+			Fraction of test paths whose model probability is at least
+			`path_ratio` times their true probability -- i.e. the proportion of
+			(true-distribution) paths the model still assigns non-trivial
+			probability to.
 	"""
 	V, n = dag.V, dag.n
 	device = resolve_device(device)
@@ -558,8 +548,10 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 	pos = np.arange(K - 1)
 
 	illegal_all, state_seen_all = [], []
-	tot_hits = tot_legal = 0
-	hits_seen = leg_seen = hits_unseen = leg_unseen = 0
+	tot_legal = 0
+	# per-path log-probability of the actual path, under the model and the truth
+	logp_model = np.zeros(num) if true_branch_p is not None else None
+	logp_true = np.zeros(num) if true_branch_p is not None else None
 
 	for s in range(0, num, batch_size):
 		e = min(num, s + batch_size)
@@ -578,7 +570,7 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 		legal = legal_mat[u]
 
 		# map probabilities back to original token identities (branch targets only;
-		# EOS is never permuted and illegal_mass/recall are relabel-invariant there)
+		# EOS is never permuted and illegal_mass is relabel-invariant there)
 		op = pv.copy()
 		if perms is not None:
 			j = cols + 1
@@ -589,24 +581,28 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 				op[np.ix_(sel, np.arange(V))] = pv[sel][:, perms[b]]
 
 		illegal = (op * (~legal)).sum(axis=1)
-		hit = (op >= recall_thresh) & legal
-		tot_hits += int(hit.sum())
 		tot_legal += int(legal.sum())
 		illegal_all.append(illegal)
 
 		if seen_states is not None:
 			state_seen_all.append(seen_states[u])
-		if seen_edges is not None:
-			se = seen_edges[u]
-			leg_seen += int((legal & se).sum())
-			hits_seen += int((hit & se).sum())
-			leg_unseen += int((legal & ~se).sum())
-			hits_unseen += int((hit & ~se).sum())
+
+		if true_branch_p is not None:
+			# the actual next token in original identities: the branch char, or
+			# EOS (token V) at the terminal step
+			gr = s + rows
+			j = cols + 1
+			correct = np.full(len(rows), V, dtype=np.int64)
+			br = j < blen[rows]
+			correct[br] = orig_chars[gr[br], j[br]]
+			p_model = op[np.arange(len(rows)), correct]
+			p_true = true_branch_p[u, correct]
+			np.add.at(logp_model, gr, np.log(p_model + 1e-30))
+			np.add.at(logp_true, gr, np.log(p_true + 1e-30))
 
 	illegal_all = np.concatenate(illegal_all) if illegal_all else np.zeros(0)
 	res = {
 		'illegal_mass': float(illegal_all.mean()) if len(illegal_all) else float('nan'),
-		'edge_recall': float(tot_hits / tot_legal) if tot_legal else float('nan'),
 		'num_states': int(len(illegal_all)),
 		'num_legal': int(tot_legal),
 	}
@@ -614,9 +610,9 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 		ss = np.concatenate(state_seen_all) if state_seen_all else np.zeros(0, bool)
 		res['illegal_mass_seen'] = float(illegal_all[ss].mean()) if ss.any() else float('nan')
 		res['illegal_mass_unseen'] = float(illegal_all[~ss].mean()) if (~ss).any() else float('nan')
-	if seen_edges is not None:
-		res['edge_recall_seen'] = float(hits_seen / leg_seen) if leg_seen else float('nan')
-		res['edge_recall_unseen'] = float(hits_unseen / leg_unseen) if leg_unseen else float('nan')
+	if true_branch_p is not None:
+		covered = (logp_model - logp_true) >= math.log(path_ratio)
+		res['path_coverage'] = float(covered.mean()) if num else float('nan')
 	return res
 
 
@@ -684,7 +680,7 @@ def _load_or_train(factory, train_fn, config, device, force=False):
 # ----------------------------------------------------------------------------
 
 def _run(sampler_name, dag, gen, train_data, test_data, perms, bin_width, mcfg, tcfg,
-		 recall_thresh, config, force, return_baseline):
+		 config, force, return_baseline):
 	"""
 	Shared training/eval driver for both experiments.
 
@@ -712,8 +708,6 @@ def _run(sampler_name, dag, gen, train_data, test_data, perms, bin_width, mcfg, 
 		Architecture config.
 	tcfg : TrainConfig
 		Optimisation config.
-	recall_thresh : float
-		Recall threshold passed to `evaluate`.
 	config : dict
 		Full configuration used as the cache key.
 	force : bool
@@ -749,20 +743,20 @@ def _run(sampler_name, dag, gen, train_data, test_data, perms, bin_width, mcfg, 
 	def train_fn(model):
 		return train_one_epoch(model, tr_full, tr_len, n, tcfg)
 
-	seen_states, seen_edges = training_visits(tr_chars, tr_len, dag)
+	seen_states = training_visits(tr_chars, tr_len, dag)
 
 	out = {}
 	if return_baseline:
 		base = evaluate(factory(), te_chars, te_len, dag, perms=perms, bin_width=bin_width,
-						recall_thresh=recall_thresh, seen_states=seen_states,
-						seen_edges=seen_edges, device=device, batch_size=tcfg.batch_size)
+						seen_states=seen_states, true_branch_p=gen.branch_p,
+						device=device, batch_size=tcfg.batch_size)
 		out.update({f'untrained_{k}': v for k, v in base.items()})
 
 	model, cached, train_loss = _load_or_train(factory, train_fn, config, device, force)
 
 	metrics = evaluate(model, te_chars, te_len, dag, perms=perms, bin_width=bin_width,
-					   recall_thresh=recall_thresh, seen_states=seen_states,
-					   seen_edges=seen_edges, device=device, batch_size=tcfg.batch_size)
+					   seen_states=seen_states, true_branch_p=gen.branch_p,
+					   device=device, batch_size=tcfg.batch_size)
 	out.update(metrics)
 	out['cached'] = cached
 	out['train_loss'] = train_loss
@@ -771,8 +765,7 @@ def _run(sampler_name, dag, gen, train_data, test_data, perms, bin_width, mcfg, 
 
 def run_experiment_1(V, n, S, N, num_train, num_test, bin_width=1, permute=False,
 					 perm_seed=0, ordering='random', dag_seed=42, data_seed=0,
-					 mcfg=None, tcfg=None, recall_thresh=DEFAULT_RECALL_THRESH,
-					 force=False, return_baseline=False):
+					 mcfg=None, tcfg=None, force=False, return_baseline=False):
 	"""
 	Experiment 1: uniform start-to-answer paths (`ReasoningGenerator.sample`).
 
@@ -808,8 +801,6 @@ def run_experiment_1(V, n, S, N, num_train, num_test, bin_width=1, permute=False
 		Architecture config; defaults to `ModelConfig()`.
 	tcfg : TrainConfig | None
 		Optimisation config; defaults to `TrainConfig()`.
-	recall_thresh : float
-		Recall threshold for `evaluate`.
 	force : bool
 		Retrain even if a cached checkpoint exists.
 	return_baseline : bool
@@ -842,17 +833,16 @@ def run_experiment_1(V, n, S, N, num_train, num_test, bin_width=1, permute=False
 				  bin_width=bin_width, perm_seed=perm_seed,
 				  model=asdict(mcfg), train=asdict(tcfg))
 	return _run('sample', dag, gen, tr, te, perms, bin_width, mcfg, tcfg,
-				recall_thresh, config, force, return_baseline)
+				config, force, return_baseline)
 
 
 def run_experiment_2(V, n, S, N, L, num_train, num_test, ordering='random',
 					 dag_seed=42, data_seed=0, mcfg=None, tcfg=None,
-					 recall_thresh=DEFAULT_RECALL_THRESH, force=False,
-					 return_baseline=False):
+					 force=False, return_baseline=False):
 	"""
 	Experiment 2: length-limited paths
 	(`ReasoningGenerator.sample_length_limited`), restricted to source-to-sink
-	paths of at most `L` edges. A model is trained for one epoch and evaluated as
+	paths of at most `L` edges. A model is trained for multiple epochs and evaluated as
 	in experiment 1, but without token permutation.
 
 	Params
@@ -875,8 +865,6 @@ def run_experiment_2(V, n, S, N, L, num_train, num_test, ordering='random',
 		Architecture config; defaults to `ModelConfig()`.
 	tcfg : TrainConfig | None
 		Optimisation config; defaults to `TrainConfig()`.
-	recall_thresh : float
-		Recall threshold for `evaluate`.
 	force : bool
 		Retrain even if a cached checkpoint exists.
 	return_baseline : bool
@@ -903,4 +891,4 @@ def run_experiment_2(V, n, S, N, L, num_train, num_test, ordering='random',
 				  data_seed=data_seed, num_train=num_train,
 				  model=asdict(mcfg), train=asdict(tcfg))
 	return _run('sample_length_limited', dag, gen, tr, te, None, None, mcfg, tcfg,
-				recall_thresh, config, force, return_baseline)
+				config, force, return_baseline)
