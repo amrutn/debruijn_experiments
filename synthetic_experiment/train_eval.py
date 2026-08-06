@@ -1,23 +1,18 @@
 """
 Training and evaluation for the synthetic De Bruijn experiments.
 
-There is no "correct" continuation to predict -- the model has to learn which
-subset of the vocabulary is legal at each state. The metric is therefore a
-support metric rather than accuracy:
+The model has to learn which subset of the vocabulary is legal at each state.
 
 illegal_mass      total probability the model puts on tokens that are not edges
-                  of D_pi. This is the direct empirical analogue of "has it
-                  learned the edge set", is well defined at every branch point
-                  regardless of out-degree, and is reported split by whether the
-                  state was visited during training.
+                  of D_pi, averaged over states in the path distribution.
 
 path_coverage     What proportion of correct paths does the model assign non-trivial
 				  probability to. A path counts as "covered" if the model assigns
-				  P_model(path) >= PATH_RATIO*P_true(path)
+				  P_model(path) >= PATH_RATIO*P_true(path).
 
 Two experiments are provided:
 
-experiment 1 (`run_experiment_1`)
+samples_vs_edges (`run_experiment_1`)
     Paths are drawn from `ReasoningGenerator.sample`. Optionally the token
     identities are scrambled by a *position dependent* deterministic
     permutation: characters in the k-th block of `bin_width` positions are
@@ -26,12 +21,12 @@ experiment 1 (`run_experiment_1`)
     and the metrics are computed after mapping the model's probabilities back to
     the original token identities.
 
-experiment 2 (`run_experiment_2`)
+length_vs_Lmax (`run_experiment_2`)
     Paths are drawn from `ReasoningGenerator.sample_length_limited`, i.e. only
     source-to-sink paths of at most `L` edges.
 
-A model is trained for a single epoch over the sampled data and cached under
-`cache/` keyed by the full configuration, then evaluated on a fresh test set.
+A model is trained on the sampled data and cached under `cache/`. Then it is
+evaluated on a test set drawn uniformly at random from the path distribution.
 """
 
 import os
@@ -52,11 +47,6 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cache')
 
 # The default path ratio when computing the path_coverage metric
 DEFAULT_PATH_RATIO = 0.1
-
-# Position augmentation (train_one_epoch, augment=True) uses randomized positional
-# encodings (Ruoss et al. 2023): each sequence is given a random strictly-increasing
-# subset of positions spanning [0, pos_cap], so even short training paths exhibit the
-# full range of relative distances (up to ~L_max) that only long paths would produce.
 
 
 @dataclass
@@ -499,13 +489,11 @@ def train_one_epoch(model, full_tokens, lengths, n, tcfg, window=None, augment=F
 		tgt = batch[:, 1:]
 		token_positions = None
 		if augment:
-			# Softened augmentation: keep tokens mostly contiguous (so each state's
+			# Augmentation: keep tokens mostly contiguous (so each state's
 			# local n-gram window stays intact) but insert ONE random gap per path,
 			# placed strictly before the last n tokens. Tokens after the gap -- and
 			# the trailing padding -- shift up by the gap size, so the path still
-			# reaches deep positions while only the ~n windows straddling the gap are
-			# disturbed; the last-n read is always contiguous. Real positions stay
-			# <= pos_cap; padding may run past it (the RoPE cache is sized for it).
+			# reaches deep positions while only ~n windows around the gap are disturbed.
 			b, W = idx.numel(), K - 1
 			cap = pos_cap if pos_cap is not None else W - 1
 			slot = torch.arange(W)
@@ -539,6 +527,8 @@ def train_one_epoch(model, full_tokens, lengths, n, tcfg, window=None, augment=F
 def _drop_extreme_per_path(values, path_idx, num_paths, k, largest):
 	"""
 	Per path, drop the `k` most extreme values and return the kept sum and count.
+	This is for simulating what decoding would be like with external ground-truth
+	"hints" about which token to take next. 
 
 	`largest=True` drops the k largest values in each path (used to give the
 	illegal_mass metric `k` free hints at its worst states); `largest=False` drops
@@ -744,12 +734,10 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 	if true_branch_p is not None:
 		covered = (logp_model - logp_true) >= math.log(path_ratio)
 		res['path_coverage'] = float(covered.mean()) if num else float('nan')
-	# hint metrics: for k = 0 .. num_hints, give each path k free ground-truth
-	# positions placed at its worst states and recompute the metric on what remains
-	# -- separately for illegal_mass (drop k highest-illegal states) and coverage
-	# (drop the k lowest log p_model/p_true terms). Index k == 0 is the baseline, so
-	# `illegal_mass_by_hints[0]` == illegal_mass and `path_coverage_by_hints[0]` ==
-	# path_coverage; slice k to read the k-hint result without recomputing.
+	# When computing metrics with "hints": Give each path k free ground-truth
+	# positions placed at its worst token predictions and recompute the metric on what remains
+	# For illegal_mass, drop the k token predictions with the most illegal mass, and for
+	# coverage, drop the k lowest log p_model/p_true terms.
 	if num_hints and len(illegal_all):
 		pidx = np.concatenate(pidx_all)
 		d = np.concatenate(d_all) if d_all is not None else None

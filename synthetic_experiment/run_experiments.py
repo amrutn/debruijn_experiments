@@ -23,7 +23,7 @@ samples_vs_edges            Scaling of the number of training samples needed to
                             of distinct transitions, plain and permuted points fall
                             on the same fitted line y = a*x (drawn dotted).
 
-length_vs_Lmax            Same criterion, but the model is trained only on paths
+length_vs_Lmax              Same criterion, but the model is trained only on paths
                             of at most L edges (`sample_length_limited`) and tested
                             on the full path distribution. y is the smallest L that
                             still reaches the criterion; x is L_max (the DAG's
@@ -56,6 +56,7 @@ import argparse
 from dataclasses import replace, asdict
 import contextlib
 import multiprocessing as mp
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -80,9 +81,8 @@ UNIT_CACHE_DIR = os.path.join(HERE, 'cache', 'exp_results')
 # criteria the model must reach
 ILLEGAL_CRIT = 0.05        # illegal_mass must drop below this
 PATH_COV_CRIT = 0.95       # path_coverage must rise above this
-HINT_MAX = 5               # length units carry the hint curve for 0..HINT_MAX hints
-                           # (each metric with its k worst positions per path dropped);
-                           # `--hints k` (k <= HINT_MAX) re-plots slice k with no retrain
+HINT_MAX = 5               # Calculate both criteria with all hint
+						   # levels up to HINT_MAX for cache.
 
 
 # ----------------------------------------------------------------------------
@@ -143,9 +143,9 @@ def _style_axis(ax):
 		axis.set_minor_formatter(mticker.NullFormatter())
 
 
-def _legend(ax, handles, loc='lower right'):
+def _legend(ax, handles, loc='lower right', bbox=None):
 	leg = ax.legend(handles=handles, fontsize=LEGEND_FS, frameon=True,
-					loc=loc, borderaxespad=0.15, handlelength=1.6,
+					loc=loc, bbox_to_anchor=bbox, borderaxespad=0.15, handlelength=1.6,
 					labelspacing=0.25, handletextpad=0.5)
 	leg.set_zorder(20)
 	frame = leg.get_frame()
@@ -411,15 +411,10 @@ def _train_short_test_full(V, n, S, N, L, num_train, num_test, ordering,
 						   num_hints=0):
 	"""
 	Train on paths of <= L edges (for `epochs` passes), evaluate on the full path
-	distribution. Returns (metrics, dag). Uses train_eval's public building blocks
-	so the train and test distributions can differ (run_experiment_2 uses the same
-	distribution for both), and so the length-limited data can be trained for
-	several epochs -- one pass over few short paths under-fits. If `window` is set,
-	training and evaluation both use sliding-window (local) attention of that width.
+	distribution. Returns (metrics, dag). If `window`, use sliding-window attention of that width.
 	If `augment` is set, each short training sequence gets one random position gap
-	(before its last n tokens, so the local n-gram window stays contiguous) that
-	shifts later tokens toward the deep positions only long paths would otherwise
-	reach (evaluation is at natural positions). If `num_hints` > 0, the metrics dict
+	(before its last n tokens) that shifts later tokens toward the deep positions.
+	Evaluation is at natural positions. If `num_hints` > 0, the metrics dict
 	also carries the hinted versions.
 	"""
 	device = resolve_device(tcfg.device)
@@ -427,24 +422,24 @@ def _train_short_test_full(V, n, S, N, L, num_train, num_test, ordering,
 	dag = build_dag(V, n, S, N, ordering=ordering, seed=dag_seed)
 	gen = ReasoningGenerator(dag)
 
-	tr_chars, tr_len = gen.sample_length_limited(num_train, L, np.random.default_rng([seed, 1]))
-	te_chars, te_len = gen.sample(num_test, np.random.default_rng([seed, 2]))
+	train_chars, train_len = gen.sample_length_limited(num_train, L, np.random.default_rng([seed, 1]))
+	test_chars, test_len = gen.sample(num_test, np.random.default_rng([seed, 2]))
 
-	tr_full = build_full_tokens(tr_chars, tr_len, V)
+	train_full = build_full_tokens(train_chars, train_len, V)
 	# augmentation samples real-token positions in [0, pos_cap] (the deepest full-path
 	# index) and lets padding continue past it; the RoPE cache must cover that overflow
 	# (real max pos_cap + up to width padding slots), so size it to max_chars + width.
 	pos_cap = gen.max_chars - 1 if augment else None
 	max_seq_len = gen.max_chars + 1                 # cover the (longer) full-path test set
 	if augment:
-		max_seq_len = gen.max_chars + tr_full.shape[1]
+		max_seq_len = gen.max_chars + train_full.shape[1]
 	model = build_model(V + 1, max_seq_len, mcfg, device, dtype, tcfg.seed)
 	for e in range(epochs):                          # reshuffle each epoch
-		train_one_epoch(model, tr_full, tr_len, n, replace(tcfg, seed=tcfg.seed + e),
+		train_one_epoch(model, train_full, train_len, n, replace(tcfg, seed=tcfg.seed + e),
 						window=window, augment=augment, pos_cap=pos_cap)
 
-	seen_states = training_visits(tr_chars, tr_len, dag)
-	metrics = evaluate(model, te_chars, te_len, dag, seen_states=seen_states,
+	seen_states = training_visits(train_chars, train_len, dag)
+	metrics = evaluate(model, test_chars, test_len, dag, seen_states=seen_states,
 					   true_branch_p=gen.branch_p, device=device, batch_size=tcfg.batch_size,
 					   window=window, num_hints=num_hints)
 	return metrics, dag
@@ -454,9 +449,8 @@ def length_unit(profile, ordering, graph, seed, device, force, windowed=False,
 				augmented=False):
 	"""
 	One point of length_vs_Lmax: the smallest training path length L that lets
-	the model reach each criterion on the full path distribution. The L sweep runs
-	up to the DAG's longest path (L_max), but stops early once path_coverage passes
-	its threshold (the binding, later criterion), so we don't keep training past it.
+	the model reach each criterion on the full path distribution. The L sweep
+	stops early once path_coverage and illegal_mass pass their threshold.
 	If `windowed` is set, training/evaluation use sliding-window attention of width
 	n -- local attention that is position-invariant and so should generalise to
 	longer paths. If `augmented` is set, the short training paths are trained with
@@ -508,8 +502,7 @@ def length_unit(profile, ordering, graph, seed, device, force, windowed=False,
 			Ls.append(L)
 			illegal_bh.append(metrics['illegal_mass_by_hints'])
 			cov_bh.append(metrics['path_coverage_by_hints'])
-			# stop on the *baseline* (0-hint) coverage so the swept range is identical
-			# to length_vs_Lmax; hinted crossings are <= baseline, hence within range
+			# stop when criteria are met with 0 "hints".
 			if metrics['path_coverage_by_hints'][0] > PATH_COV_CRIT:
 				break
 
@@ -536,10 +529,8 @@ def length_unit(profile, ordering, graph, seed, device, force, windowed=False,
 # Number of parallel worker *processes* for _run_units; set by main() from --workers.
 # Processes (not threads) are used so the CPU-bound parts (path sampling, DAG
 # building, the numpy eval/hint post-processing) run in parallel rather than
-# serializing on the GIL -- these runs are CPU-bound, the tiny models leave the
-# GPUs idle. Each unit is submitted exactly once, so no unit is ever computed by
-# two workers (that is what avoids redundant recomputation); already-cached units
-# are read instantly. None -> default of len(devices).
+# serializing on the GIL. Already-cached units are read instantly.
+# None -> default of len(devices).
 _N_WORKERS = None
 
 
@@ -638,7 +629,7 @@ def percentile_length(gen, pct=95, num=20000, seed=0):
 	return float(np.percentile(lengths - gen.n, pct))
 
 
-def plot_samples_vs_edges(results, name):
+def plot_samples_vs_edges(results, name, fit_plain_only=False):
 	"""
 	x = edges (distinct transitions the learner must acquire), y = samples to
 	reach a criterion, both averaged over the seeds (runs).
@@ -647,7 +638,8 @@ def plot_samples_vs_edges(results, name):
 	count is inflated by the bucket width); error bars are +/- SEM over the seeds.
 	Within each graph a translucent line joins plain -> widest bucket -> ... ->
 	narrowest bucket. The dotted least-squares power-law fit per criterion is fit to
-	ALL points (plain and permuted).
+	all points (plain and permuted), or to the plain points only when
+	`fit_plain_only` is set.
 	"""
 	fig, ax = plt.subplots(figsize=(3, 2.5))
 	# trajectory order: plain, then widest bucket down to narrowest (== increasing
@@ -679,7 +671,8 @@ def plot_samples_vs_edges(results, name):
 			if len(traj) >= 2:
 				ax.plot([t[0] for t in traj], [t[1] for t in traj],
 						ls='-', lw=0.8, color=col, alpha=0.3, zorder=1)
-		# one point (seed mean +/- SEM) per (graph, bucket); fit over ALL points
+		# one point (seed mean +/- SEM) per (graph, bucket); all points are plotted,
+		# but the fit uses all points, or only the plain ones if fit_plain_only
 		fx, fy = [], []
 		for (g, bw), (x, mean, sem, n) in pts.items():
 			any_pts = True
@@ -687,8 +680,9 @@ def plot_samples_vs_edges(results, name):
 			ax.errorbar(x, mean, yerr=sem, fmt='o', ms=3.8, mew=1.0,
 						markerfacecolor=(col if filled else 'none'), markeredgecolor=col,
 						ecolor=col, elinewidth=0.7, capsize=0, alpha=0.85, zorder=3)
-			fx.append(x)                                 # fit uses plain AND permuted
-			fy.append(mean)
+			if filled or not fit_plain_only:
+				fx.append(x)
+				fy.append(mean)
 		fits[key] = _loglog_fit(fx, fy)
 		if fits[key]:
 			fit_lines.append((fits[key], col))
@@ -719,6 +713,113 @@ def plot_samples_vs_edges(results, name):
 	], loc='lower right')
 	# fit coefficients (all points) are recorded in the provenance, not here
 	return _save(fig, name), fits
+
+
+def _min_cover_by_graph(results, profile, ordering):
+	"""
+	Mean and SEM (over the graph seeds) of the minimum number of source-to-sink
+	paths needed to cover every edge of the DAG, per (V, n). Uses theory's exact
+	min-flow `calc_min_cover`. S, N come from the profile (the samples results only
+	store V, n); each seed rebuilds its own DAG (dag_seed == seed).
+	"""
+	import sys
+	theory_dir = os.path.join(os.path.dirname(HERE), 'theory')
+	if theory_dir not in sys.path:
+		sys.path.insert(0, theory_dir)
+	from theorem1_theorem2 import calc_min_cover
+
+	sn = {(V, n): (S, N) for (V, n, S, N) in profile['graphs']}
+	seeds_by_g = defaultdict(set)
+	for r in results:
+		seeds_by_g[(r['V'], r['n'])].add(r['seed'])
+
+	out = {}
+	for g, seeds in seeds_by_g.items():
+		if g not in sn:
+			continue
+		V, n = g
+		S, N = sn[g]
+		vals = np.array([calc_min_cover(build_dag(V, n, S, N, ordering=ordering, seed=s))
+						 for s in sorted(seeds)], float)
+		sem = float(vals.std(ddof=1) / np.sqrt(len(vals))) if len(vals) > 1 else 0.0
+		out[g] = (float(vals.mean()), sem)
+	return out
+
+
+def plot_sample_efficiency_vs_edges(results, name, mincover):
+	"""
+	x = edges, y = sample efficiency = (min paths to cover all edges) / (samples to
+	reach a criterion). The numerator is the per-(V,n) mean over seeds of the exact
+	min edge-cover; the denominator is the seed-mean samples (as in samples_vs_edges).
+	Both criteria are shown (illegal blue, coverage green), plain markers filled /
+	permuted hollow, with a thin line joining each graph's plain -> permuted points
+	and a thick line joining the plain points across graphs (per criterion). x is
+	log-scaled, y linear. Error bars combine the two SEMs by error propagation for a
+	ratio. No fits.
+	"""
+	fig, ax = plt.subplots(figsize=(3, 2.5))
+	bw_order = [None] + sorted({r['bin_width'] for r in results
+								if r['bin_width'] is not None}, reverse=True)
+	graphs = []
+	for r in results:
+		g = (r['V'], r['n'])
+		if g not in graphs:
+			graphs.append(g)
+
+	any_pts = False
+	for key, col in [('samples_illegal', CURVE_COLORS[0]), ('samples_coverage', CURVE_COLORS[1])]:
+		pts = {}
+		for g in graphs:
+			if g not in mincover:
+				continue
+			mc, mc_sem = mincover[g]
+			for bw in bw_order:
+				group = [r for r in results if (r['V'], r['n']) == g and r['bin_width'] == bw]
+				a = _agg_over_seeds(group, key, drop_censored=True) if group else None
+				if not a:
+					continue
+				s_mean, s_sem, _ = a
+				if s_mean <= 0 or mc <= 0:
+					continue
+				edges = float(np.mean([r['distinct_edges'] for r in group]))
+				eff = mc / s_mean
+				# error propagation for the ratio N/D (treating N, D as independent)
+				rel = np.sqrt((mc_sem / mc) ** 2 + (s_sem / s_mean) ** 2)
+				pts[(g, bw)] = (edges, eff, eff * rel)
+		# thin line joining plain -> widest bucket -> ... -> narrowest, per graph
+		for g in graphs:
+			traj = [pts[(g, bw)][:2] for bw in bw_order if (g, bw) in pts]
+			if len(traj) >= 2:
+				ax.plot([t[0] for t in traj], [t[1] for t in traj],
+						ls='-', lw=0.8, color=col, alpha=0.3, zorder=1)
+		# thick line joining the plain points across graphs (per criterion)
+		plain = sorted(pts[(g, None)][:2] for g in graphs if (g, None) in pts)
+		if len(plain) >= 2:
+			ax.plot([p[0] for p in plain], [p[1] for p in plain],
+					ls='-', lw=2.0, color=col, alpha=0.85, zorder=2)
+		for (g, bw), (x, eff, err) in pts.items():
+			any_pts = True
+			filled = bw is None
+			ax.errorbar(x, eff, yerr=err, fmt='o', ms=3.8, mew=1.0,
+						markerfacecolor=(col if filled else 'none'), markeredgecolor=col,
+						ecolor=col, elinewidth=0.7, capsize=0, alpha=0.85, zorder=3)
+
+	if any_pts:
+		ax.set_xscale('log')                           # x log, y linear
+	ax.set_xlabel('Edges', fontsize=LABEL_FS)
+	ax.set_ylabel('Sample Efficiency', fontsize=LABEL_FS)
+	_style_axis(ax)
+	# both legends stacked at the top-left (criteria on top, plain/permuted below)
+	crit = _legend(ax, [
+		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label='illegal <0.05'),
+		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label='coverage >0.95'),
+	], loc='upper left')
+	ax.add_artist(crit)
+	_legend(ax, [
+		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, label='plain'),
+		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, mfc='none', label='permuted'),
+	], loc='upper left', bbox=(0.0, 0.80))
+	return _save(fig, name)
 
 
 def plot_length_vs_Lmax(results, name):
@@ -798,7 +899,7 @@ def plot_length_vs_Lmax(results, name):
 # top-level figure orchestration
 # ----------------------------------------------------------------------------
 
-def _write_provenance(name, kind, profile, ordering, results, fits=None):
+def write_provenance(name, kind, profile, ordering, results, fits=None):
 	"""
 	Everything needed to reproduce a figure: the exact conditions swept (graphs,
 	buckets/lengths, seeds, grids), the shared model/optimiser settings, the seed
@@ -824,8 +925,9 @@ def _write_provenance(name, kind, profile, ordering, results, fits=None):
 		},
 	)
 	if kind == 'samples':
-		# power-law fits y = c * x^b (x = distinct edges, y = samples), least
-		# squares in log10 over the plain, non-censored points only
+		# power-law fits y = c * x^b (x = distinct edges, y = samples), least squares
+		# in log10 over the plain (non-permuted, non-censored) points only
+		fit_scope = 'plain (non-permuted, non-censored) points'
 		labels = {'samples_illegal': 'illegal_mass < %s' % ILLEGAL_CRIT,
 				  'samples_coverage': 'path_coverage > %s' % PATH_COV_CRIT}
 		fit_summary = {}
@@ -834,7 +936,7 @@ def _write_provenance(name, kind, profile, ordering, results, fits=None):
 			fit_summary[label] = (None if not f else dict(
 				coefficient_c=f[1], exponent_b=f[0],
 				equation='y = %.6g * x^%.6g' % (f[1], f[0]),
-				fitted_over='all points (plain and permuted, non-censored)'))
+				fitted_over=fit_scope))
 		experiment = dict(
 			description='experiment 1: uniform paths (ReasoningGenerator.sample); '
 						'samples to reach a criterion vs distinct transitions',
@@ -894,9 +996,25 @@ def build_samples_vs_edges(profile, ordering, devices, force, name):
 	os.makedirs(FIG_DIR, exist_ok=True)
 	with open(os.path.join(FIG_DIR, name + '.json'), 'w') as f:
 		json.dump(results, f, indent=1)
-	path, fits = plot_samples_vs_edges(results, name)
-	_write_provenance(name, 'samples', profile, ordering, results, fits=fits)
+	path, fits = plot_samples_vs_edges(results, name, fit_plain_only=True)
+	write_provenance(name, 'samples', profile, ordering, results, fits=fits)
 	print(f"[{name}] saved {path}.pdf/.png (+ {name}.json, {name}_provenance.json)")
+
+
+def build_sample_efficiency_vs_edges(profile, ordering, devices, force, name):
+	"""Reuse the cached samples_vs_edges results (no retraining) and plot sample
+	efficiency = (min paths to cover all edges) / samples. Reads the samples figure
+	JSON produced by build_samples_vs_edges for the same ordering."""
+	samples_name = 'samples_vs_edges' + ('_digit_sum' if ordering == 'digit_sum' else '')
+	src = os.path.join(FIG_DIR, samples_name + '.json')
+	if not os.path.exists(src):
+		raise FileNotFoundError(f"{src} not found -- build {samples_name} first "
+								f"(this plot reuses its results, it does not retrain)")
+	with open(src) as f:
+		results = json.load(f)
+	mincover = _min_cover_by_graph(results, profile, ordering)
+	path = plot_sample_efficiency_vs_edges(results, name, mincover)
+	print(f"[{name}] saved {path}.pdf/.png (from {samples_name}.json, no retraining)")
 
 
 def build_length_vs_Lmax(profile, ordering, devices, force, name, windowed=False,
@@ -918,14 +1036,17 @@ def build_length_vs_Lmax(profile, ordering, devices, force, name, windowed=False
 	else:
 		plot_results = results
 	path, fits = plot_length_vs_Lmax(plot_results, name)
-	_write_provenance(name, 'length', profile, ordering, results, fits=fits)
+	write_provenance(name, 'length', profile, ordering, results, fits=fits)
 	print(f"[{name}] saved {path}.pdf/.png (+ {name}.json, {name}_provenance.json)")
 
 
 FIGURES = {
 	'samples_vs_edges': lambda p, d, f: build_samples_vs_edges(p, 'random', d, f, 'samples_vs_edges'),
+	# sample efficiency = min-edge-cover paths / samples; reuses samples_vs_edges results (no retrain)
+	'sample_efficiency_vs_edges': lambda p, d, f: build_sample_efficiency_vs_edges(p, 'random', d, f, 'sample_efficiency_vs_edges'),
 	'length_vs_Lmax': lambda p, d, f: build_length_vs_Lmax(p, 'random', d, f, 'length_vs_Lmax'),
 	'samples_vs_edges_digit_sum': lambda p, d, f: build_samples_vs_edges(p, 'digit_sum', d, f, 'samples_vs_edges_digit_sum'),
+	'sample_efficiency_vs_edges_digit_sum': lambda p, d, f: build_sample_efficiency_vs_edges(p, 'digit_sum', d, f, 'sample_efficiency_vs_edges_digit_sum'),
 	'length_vs_Lmax_digit_sum': lambda p, d, f: build_length_vs_Lmax(p, 'digit_sum', d, f, 'length_vs_Lmax_digit_sum'),
 	# windowed (local) attention: length generalisation with a sliding window of width n
 	'length_vs_Lmax_windowed': lambda p, d, f: build_length_vs_Lmax(p, 'random', d, f, 'length_vs_Lmax_windowed', windowed=True),
@@ -954,7 +1075,7 @@ def main():
 	ap.add_argument('--figures', default=None,
 					help="comma-separated subset of: " + ', '.join(FIGURES))
 	ap.add_argument('--digit-sum', action='store_true',
-					help="also make the digit-sum-ordering figures (off by default)")
+					help="also make the digit-sum-ordering versions of all figures")
 	ap.add_argument('--windowed-attention', action='store_true',
 					help="also repeat length_vs_Lmax with sliding-window (local) "
 						 "attention of width n (off by default)")
