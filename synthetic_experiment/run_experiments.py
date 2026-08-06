@@ -1,18 +1,18 @@
 """
 Run the synthetic De Bruijn training experiments and make the figures.
 
-A decoder-only transformer is trained from scratch (one epoch) on paths sampled
+A decoder-only transformer is trained from scratch on paths sampled
 from D_pi = F[B(V,n); pi, N, S]. There is no prompt: the model has to learn
 which subset of the vocabulary is legal at each state, measured by `illegal_mass`
 and `path_coverage` (see train_eval.py). Two criteria mark "has learned it":
 illegal_mass < 0.05 and path_coverage > 0.95.
 
-Figures (each a publication-size (3, 2.5) pdf+png in figures/)
+Figures (each size (3, 2.5) pdf+png in figures/)
 -------
 samples_vs_edges            Scaling of the number of training samples needed to
                             reach each criterion (illegal_mass < 0.05 in blue,
                             path_coverage > 0.95 in green) vs the number
-                            of transitions the model must learn. pi is a random
+                            of edges the model must learn. The ordering pi is a random
                             permutation. Filled markers are plain De Bruijn DAGs
                             (x = number of edges). Hollow markers are the same
                             DAGs with the token identities scrambled by a
@@ -27,12 +27,8 @@ length_vs_Lmax            Same criterion, but the model is trained only on paths
                             of at most L edges (`sample_length_limited`) and tested
                             on the full path distribution. y is the smallest L that
                             still reaches the criterion; x is L_max (the DAG's
-                            longest path). A dotted y = x line marks "must train on
-                            ~full-length paths". No permutation. (Points are means
-                            over the seeds, plus a linear fit.)
+                            longest path). 
 
-samples_vs_edges_digit_sum  samples_vs_edges for the digit-sum ordering of pi.
-length_vs_Lmax_digit_sum  length_vs_Lmax for the digit-sum ordering of pi.
 
 Caching
 -------
@@ -44,10 +40,10 @@ Pass --force to recompute.
 Usage
 -----
     python run_experiments.py                  # auto: 'full' on CUDA else 'laptop'
-    python run_experiments.py --profile full   # the cluster sweep (< 30 min on 2x4090)
-    python run_experiments.py --profile laptop # quick, partial, for a laptop (mps/cpu)
+    python run_experiments.py --profile full   # the full run
+    python run_experiments.py --profile laptop # quick, partial results for a laptop
     python run_experiments.py --devices cuda:0,cuda:1
-    python run_experiments.py --figures samples_vs_edges --force
+    python run_experiments.py --figures samples_vs_edges --force # force rerun of a specific figure
 """
 
 import os
@@ -58,7 +54,9 @@ import time
 import hashlib
 import argparse
 from dataclasses import replace, asdict
-from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -82,6 +80,9 @@ UNIT_CACHE_DIR = os.path.join(HERE, 'cache', 'exp_results')
 # criteria the model must reach
 ILLEGAL_CRIT = 0.05        # illegal_mass must drop below this
 PATH_COV_CRIT = 0.95       # path_coverage must rise above this
+HINT_MAX = 5               # length units carry the hint curve for 0..HINT_MAX hints
+                           # (each metric with its k worst positions per path dropped);
+                           # `--hints k` (k <= HINT_MAX) re-plots slice k with no retrain
 
 
 # ----------------------------------------------------------------------------
@@ -93,7 +94,7 @@ CURVE_COLORS = ['#2a78d6', '#008300', '#e87ba4', '#eda100']   # blue, green, mag
 CURVE_MARKERS = ['o', 's', '^', 'D']
 LABEL_FS = 14
 TICK_FS = 12
-LEGEND_FS = 8
+LEGEND_FS = 7
 
 
 def _log_tick_fmt(v, _):
@@ -170,13 +171,18 @@ def _save(fig, name):
 # the pipeline on mps/cpu.
 # ----------------------------------------------------------------------------
 
+def _geomgrid(lo, hi, n):
+	"""`n` integers geometrically spaced over [lo, hi] (deduped, sorted)."""
+	return sorted({int(round(x)) for x in np.geomspace(lo, hi, n)})
+
+
 PROFILES = {
 	'laptop': dict(
 		# (V, n, S, N) De Bruijn graphs, spanning n=2 and n=3
 		graphs=[(8, 2, 5, 8), (10, 2, 6, 10), (8, 3, 10, 20), (12, 3, 10, 20)],
 		bin_widths=[None, 16, 8, 4],                # None == plain; else permutation bucket width
-		num_train_grid=[316, 1000, 3162, 10000, 31623, 63246],
-		L_grid=[2, 4, 6, 8, 12, 16, 20],
+		num_train_grid=_geomgrid(316, 63246, 15),   # dense geometric grid (~1.5x steps)
+		L_grid=list(range(1, 40)),                  # every integer length (up to L_max)
 		length_num_train=16000,
 		length_epochs=6,                            # short-path data is trained several passes
 		num_test=2000,
@@ -190,8 +196,8 @@ PROFILES = {
 				(8, 3, 10, 20), (10, 3, 12, 24), (11, 3, 14, 28), (12, 3, 15, 30),
 				(8, 4, 12, 24), (9, 4, 14, 28), (10, 4, 16, 32)],
 		bin_widths=[None, 16, 8, 4],
-		num_train_grid=[316, 1000, 3162, 10000, 31623, 100000, 316228],
-		L_grid=[2, 3, 4, 6, 8, 12, 16, 20, 24],
+		num_train_grid=_geomgrid(316, 316228, 22),  # dense geometric grid (~1.4x steps)
+		L_grid=list(range(1, 40)),                  # every integer length (up to L_max)
 		length_num_train=64000,
 		length_epochs=12,
 		num_test=8000,
@@ -356,7 +362,7 @@ def samples_unit(profile, ordering, graph, bin_width, seed, device, force):
 	criterion, the transition count, and the coverage-only reference.
 	"""
 	V, n, S, N = graph
-	dag_seed = 0            # fixed per graph so the seeds are replicates on one DAG
+	dag_seed = seed        # each seed draws a fresh DAG
 	spec = dict(kind='samples', ordering=ordering, V=V, n=n, S=S, N=N,
 				bin_width=bin_width, seed=seed, dag_seed=dag_seed,
 				grid=profile['num_train_grid'], num_test=profile['num_test'],
@@ -377,9 +383,8 @@ def samples_unit(profile, ordering, graph, bin_width, seed, device, force):
 			grid.append(num_train)
 			illegal.append(metrics['illegal_mass'])
 			path_cov.append(metrics['path_coverage'])
-			# stop only once BOTH criteria are met; path_coverage > 0.95 is reached
-			# later than illegal < 0.05, so stopping on illegal alone would leave the
-			# coverage crossing unbracketed (nan) and drop the green point
+			# stop once both criteria are met; path_coverage > 0.95 is reached
+			# later than illegal < 0.05
 			if metrics['illegal_mass'] < ILLEGAL_CRIT and metrics['path_coverage'] > PATH_COV_CRIT:
 				break
 		return dict(
@@ -402,13 +407,20 @@ def samples_unit(profile, ordering, graph, bin_width, seed, device, force):
 
 
 def _train_short_test_full(V, n, S, N, L, num_train, num_test, ordering,
-						   dag_seed, seed, mcfg, tcfg, epochs):
+						   dag_seed, seed, mcfg, tcfg, epochs, window=None, augment=False,
+						   num_hints=0):
 	"""
 	Train on paths of <= L edges (for `epochs` passes), evaluate on the full path
 	distribution. Returns (metrics, dag). Uses train_eval's public building blocks
 	so the train and test distributions can differ (run_experiment_2 uses the same
 	distribution for both), and so the length-limited data can be trained for
-	several epochs -- one pass over few short paths under-fits.
+	several epochs -- one pass over few short paths under-fits. If `window` is set,
+	training and evaluation both use sliding-window (local) attention of that width.
+	If `augment` is set, each short training sequence gets one random position gap
+	(before its last n tokens, so the local n-gram window stays contiguous) that
+	shifts later tokens toward the deep positions only long paths would otherwise
+	reach (evaluation is at natural positions). If `num_hints` > 0, the metrics dict
+	also carries the hinted versions.
 	"""
 	device = resolve_device(tcfg.device)
 	dtype = _DTYPES[tcfg.dtype]
@@ -418,33 +430,58 @@ def _train_short_test_full(V, n, S, N, L, num_train, num_test, ordering,
 	tr_chars, tr_len = gen.sample_length_limited(num_train, L, np.random.default_rng([seed, 1]))
 	te_chars, te_len = gen.sample(num_test, np.random.default_rng([seed, 2]))
 
-	max_seq_len = gen.max_chars + 1                 # cover the (longer) full-path test set
-	model = build_model(V + 1, max_seq_len, mcfg, device, dtype, tcfg.seed)
 	tr_full = build_full_tokens(tr_chars, tr_len, V)
+	# augmentation samples real-token positions in [0, pos_cap] (the deepest full-path
+	# index) and lets padding continue past it; the RoPE cache must cover that overflow
+	# (real max pos_cap + up to width padding slots), so size it to max_chars + width.
+	pos_cap = gen.max_chars - 1 if augment else None
+	max_seq_len = gen.max_chars + 1                 # cover the (longer) full-path test set
+	if augment:
+		max_seq_len = gen.max_chars + tr_full.shape[1]
+	model = build_model(V + 1, max_seq_len, mcfg, device, dtype, tcfg.seed)
 	for e in range(epochs):                          # reshuffle each epoch
-		train_one_epoch(model, tr_full, tr_len, n, replace(tcfg, seed=tcfg.seed + e))
+		train_one_epoch(model, tr_full, tr_len, n, replace(tcfg, seed=tcfg.seed + e),
+						window=window, augment=augment, pos_cap=pos_cap)
 
 	seen_states = training_visits(tr_chars, tr_len, dag)
 	metrics = evaluate(model, te_chars, te_len, dag, seen_states=seen_states,
-					   true_branch_p=gen.branch_p, device=device, batch_size=tcfg.batch_size)
+					   true_branch_p=gen.branch_p, device=device, batch_size=tcfg.batch_size,
+					   window=window, num_hints=num_hints)
 	return metrics, dag
 
 
-def length_unit(profile, ordering, graph, seed, device, force):
+def length_unit(profile, ordering, graph, seed, device, force, windowed=False,
+				augmented=False):
 	"""
 	One point of length_vs_Lmax: the smallest training path length L that lets
 	the model reach each criterion on the full path distribution. The L sweep runs
 	up to the DAG's longest path (L_max), but stops early once path_coverage passes
 	its threshold (the binding, later criterion), so we don't keep training past it.
+	If `windowed` is set, training/evaluation use sliding-window attention of width
+	n -- local attention that is position-invariant and so should generalise to
+	longer paths. If `augmented` is set, the short training paths are trained with
+	random non-contiguous RoPE position gaps (position-augmentation) instead.
+
+	Every evaluation also carries the hint curve (metrics at 0..HINT_MAX free
+	ground-truth hints per path, see evaluate), so `minL_illegal_by_hints[k]` /
+	`minL_coverage_by_hints[k]` give the crossings under k hints without any
+	retraining -- the `--hints k` plots just read slice k. Index 0 is the baseline.
 	"""
 	V, n, S, N = graph
-	dag_seed = 0            # fixed per graph so the seeds are replicates on one DAG
+	dag_seed = seed        # each seed draws a fresh DAG, so the spread over seeds
+						   # reflects graph-to-graph variability, not just training noise
 	num_train = profile['length_num_train']
 	epochs = profile['length_epochs']
+	window = n if windowed else None
 	spec = dict(kind='length', ordering=ordering, V=V, n=n, S=S, N=N, seed=seed,
 				dag_seed=dag_seed, L_grid=profile['L_grid'], num_train=num_train,
-				epochs=epochs, num_test=profile['num_test'],
+				epochs=epochs, num_test=profile['num_test'], hint_max=HINT_MAX,
 				model=profile['model'], train=profile['train'])
+	if windowed:                        # keep the baseline spec (and its cache key)
+		spec['window'] = window         # byte-identical to earlier runs
+	if augmented:
+		spec['augment'] = 'softgap'         # softened single-gap augmentation (bumped again,
+											# so caches from earlier augment methods recompute)
 
 	def compute():
 		mcfg = _mcfg(profile)
@@ -457,29 +494,35 @@ def length_unit(profile, ordering, graph, seed, device, force):
 		num_states, num_edges = int(dag0.num_nodes), int(dag0.num_edges)
 		L_values = sorted({L for L in profile['L_grid'] if L < L_max} | {L_max})
 
-		Ls, illegal, path_cov = [], [], []
+		Ls, illegal_bh, cov_bh = [], [], []        # per-L hint curves (len HINT_MAX+1)
 		for L in L_values:
 			try:
 				metrics, _ = _train_short_test_full(
 					V, n, S, N, L, num_train, profile['num_test'], ordering,
-					dag_seed, seed, mcfg, tcfg, epochs)
+					dag_seed, seed, mcfg, tcfg, epochs, window=window, augment=augmented,
+					num_hints=HINT_MAX)
 			except ValueError:
 				# no source-to-sink path with <= L edges: nothing to train on at
 				# this L, so skip it and move on to the next (larger) L
 				continue
 			Ls.append(L)
-			illegal.append(metrics['illegal_mass'])
-			path_cov.append(metrics['path_coverage'])
-			# path_coverage is the binding criterion (reached last); once it passes,
-			# the illegal crossing is already recorded, so stop training at larger L
-			if metrics['path_coverage'] > PATH_COV_CRIT:
+			illegal_bh.append(metrics['illegal_mass_by_hints'])
+			cov_bh.append(metrics['path_coverage_by_hints'])
+			# stop on the *baseline* (0-hint) coverage so the swept range is identical
+			# to length_vs_Lmax; hinted crossings are <= baseline, hence within range
+			if metrics['path_coverage_by_hints'][0] > PATH_COV_CRIT:
 				break
+
+		il = np.array(illegal_bh, float).reshape(len(Ls), HINT_MAX + 1)
+		cv = np.array(cov_bh, float).reshape(len(Ls), HINT_MAX + 1)
+		minL_il = [_crossing(Ls, il[:, k], ILLEGAL_CRIT, want_below=True) for k in range(HINT_MAX + 1)]
+		minL_cov = [_crossing(Ls, cv[:, k], PATH_COV_CRIT, want_below=False) for k in range(HINT_MAX + 1)]
 		return dict(
 			V=V, n=n, S=S, N=N, seed=seed, ordering=ordering, num_states=num_states,
-			num_edges=num_edges, L_max=int(L_max), L95=L95,
-			Ls=Ls, illegal=illegal, path_coverage=path_cov,
-			minL_illegal=_crossing(Ls, illegal, ILLEGAL_CRIT, want_below=True),
-			minL_coverage=_crossing(Ls, path_cov, PATH_COV_CRIT, want_below=False),
+			num_edges=num_edges, L_max=int(L_max), L95=L95, window=window, augment=augmented,
+			Ls=Ls, illegal=il[:, 0].tolist(), path_coverage=cv[:, 0].tolist(),
+			minL_illegal=minL_il[0], minL_coverage=minL_cov[0],
+			minL_illegal_by_hints=minL_il, minL_coverage_by_hints=minL_cov,
 		)
 
 	return _cached_unit(spec, compute, force)[0]
@@ -490,26 +533,50 @@ def length_unit(profile, ordering, graph, seed, device, force):
 # heavy work is in torch/numpy which release the GIL)
 # ----------------------------------------------------------------------------
 
+# Number of parallel worker *processes* for _run_units; set by main() from --workers.
+# Processes (not threads) are used so the CPU-bound parts (path sampling, DAG
+# building, the numpy eval/hint post-processing) run in parallel rather than
+# serializing on the GIL -- these runs are CPU-bound, the tiny models leave the
+# GPUs idle. Each unit is submitted exactly once, so no unit is ever computed by
+# two workers (that is what avoids redundant recomputation); already-cached units
+# are read instantly. None -> default of len(devices).
+_N_WORKERS = None
+
+
 def _run_units(unit_fn, jobs, devices, force, desc='units'):
-	"""Compute `jobs` (list of kwargs dicts) via `unit_fn`, one worker per device,
-	showing a tqdm progress bar (thread-safe update/write across the workers)."""
+	"""Compute `jobs` (list of kwargs dicts) via `unit_fn` across a pool of worker
+	processes (round-robin over `devices`), showing a tqdm progress bar. Each job is
+	dispatched once -- no redundant recomputation -- and results are collected as
+	they finish."""
 	results = [None] * len(jobs)
+	workers = min(_N_WORKERS or len(devices), len(jobs))
 	bar = tqdm(total=len(jobs), desc=desc, unit='unit')
 
-	def work(i):
-		device = devices[i % len(devices)]
-		t0 = time.time()
-		results[i] = unit_fn(device=device, force=force, **jobs[i])
-		tag = {k: jobs[i][k] for k in ('graph', 'bin_width', 'seed') if k in jobs[i]}
-		bar.write(f"  [{device}] {tag} done in {time.time() - t0:.1f}s")
-		bar.update(1)
+	if workers <= 1:                                   # serial (debug / single unit)
+		for i, job in enumerate(jobs):
+			results[i] = unit_fn(device=devices[i % len(devices)], force=force, **job)
+			bar.update(1)
+		bar.close()
+		return results
 
-	if len(devices) == 1:
-		for i in range(len(jobs)):
-			work(i)
-	else:
-		with ThreadPoolExecutor(max_workers=len(devices)) as ex:
-			list(ex.map(work, range(len(jobs))))
+	# One process pool per device (spawn, required for CUDA in children), so each
+	# worker only ever touches its own GPU -- it holds a single CUDA context instead
+	# of drifting across all devices. per_dev workers per device ~= workers total.
+	ctx = mp.get_context('spawn')
+	per_dev = max(1, -(-workers // len(devices)))      # ceil(workers / #devices)
+	with contextlib.ExitStack() as stack:
+		pools = {d: stack.enter_context(ProcessPoolExecutor(max_workers=per_dev, mp_context=ctx))
+				 for d in devices}
+		fut_to_i = {}
+		for i, job in enumerate(jobs):
+			d = devices[i % len(devices)]
+			fut_to_i[pools[d].submit(unit_fn, device=d, force=force, **job)] = i
+		for fut in as_completed(fut_to_i):
+			i = fut_to_i[fut]
+			results[i] = fut.result()                  # re-raises any error from the worker
+			tag = {k: jobs[i][k] for k in ('graph', 'bin_width', 'seed') if k in jobs[i]}
+			bar.write(f"  [{devices[i % len(devices)]}] {tag} done")
+			bar.update(1)
 	bar.close()
 	return results
 
@@ -518,33 +585,31 @@ def _run_units(unit_fn, jobs, devices, force, desc='units'):
 # figure builders
 # ----------------------------------------------------------------------------
 
-def _loglog_fit(ax, xs, ys, col):
+def _loglog_fit(xs, ys):
 	"""
 	Least-squares power-law fit y = c * x^b (a straight line on log-log axes).
-	Draws the line and returns (b, c); None if there are < 2 points.
+	Returns (b, c), or None if there are < 2 usable points. Drawing is left to the
+	caller so the line can span the full axis range once the limits are known.
 	"""
 	xs, ys = np.asarray(xs, float), np.asarray(ys, float)
 	m = np.isfinite(xs) & np.isfinite(ys) & (xs > 0) & (ys > 0)
 	if m.sum() < 2:
 		return None
 	b, a = np.polyfit(np.log10(xs[m]), np.log10(ys[m]), 1)   # log10 y = b log10 x + a
-	gx = np.array([xs[m].min() * 0.75, xs[m].max() * 1.3])
-	ax.plot(gx, 10 ** a * gx ** b, ls=':', lw=1.1, color=col, zorder=0)
 	return float(b), float(10 ** a)
 
 
-def _linear_fit(ax, xs, ys, col):
+def _linear_fit(xs, ys):
 	"""
-	Least-squares linear fit y = m * x + c (both axes linear). Draws the line and
-	returns (m, c); None if there are < 2 points.
+	Least-squares linear fit y = m * x + c (both axes linear). Returns (m, c), or
+	None if there are < 2 finite points. Drawing is left to the caller so the line
+	can span the full axis range once the limits are known.
 	"""
 	xs, ys = np.asarray(xs, float), np.asarray(ys, float)
 	mask = np.isfinite(xs) & np.isfinite(ys)
 	if mask.sum() < 2:
 		return None
 	m, c = np.polyfit(xs[mask], ys[mask], 1)
-	gx = np.array([xs[mask].min(), xs[mask].max()])
-	ax.plot(gx, m * gx + c, ls=':', lw=1.1, color=col, zorder=1)
 	return float(m), float(c)
 
 
@@ -579,9 +644,10 @@ def plot_samples_vs_edges(results, name):
 	reach a criterion, both averaged over the seeds (runs).
 	Both criteria are shown: illegal (blue) and coverage (green). Plain De Bruijn
 	DAGs are filled markers, position-permuted controls are hollow (their edge
-	count is inflated by the bucket width). Within each graph a translucent line
-	joins plain -> widest bucket -> ... -> narrowest bucket. The dotted
-	least-squares power-law fit per criterion is fit to the plain points only.
+	count is inflated by the bucket width); error bars are +/- SEM over the seeds.
+	Within each graph a translucent line joins plain -> widest bucket -> ... ->
+	narrowest bucket. The dotted least-squares power-law fit per criterion is fit to
+	ALL points (plain and permuted).
 	"""
 	fig, ax = plt.subplots(figsize=(3, 2.5))
 	# trajectory order: plain, then widest bucket down to narrowest (== increasing
@@ -596,6 +662,7 @@ def plot_samples_vs_edges(results, name):
 
 	any_pts = False
 	fits = {}
+	fit_lines = []          # (fit_params, color) to draw across the full x-range later
 	for key, col in [('samples_illegal', CURVE_COLORS[0]), ('samples_coverage', CURVE_COLORS[1])]:
 		# one aggregated point (mean over seeds) per (graph, bucket)
 		pts = {}
@@ -604,29 +671,39 @@ def plot_samples_vs_edges(results, name):
 				group = [r for r in results if (r['V'], r['n']) == g and r['bin_width'] == bw]
 				a = _agg_over_seeds(group, key, drop_censored=True) if group else None
 				if a:
-					pts[(g, bw)] = (group[0]['distinct_edges'],) + a
+					edges = float(np.mean([r['distinct_edges'] for r in group]))
+					pts[(g, bw)] = (edges,) + a          # (edges, samples_mean, samples_sem, n)
 		# connecting trajectory per graph, in bucket order
 		for g in graphs:
 			traj = [pts[(g, bw)][:2] for bw in bw_order if (g, bw) in pts]
 			if len(traj) >= 2:
 				ax.plot([t[0] for t in traj], [t[1] for t in traj],
 						ls='-', lw=0.8, color=col, alpha=0.3, zorder=1)
-		# one point (seed mean) per (graph, bucket); fit over the plain points only
+		# one point (seed mean +/- SEM) per (graph, bucket); fit over ALL points
 		fx, fy = [], []
 		for (g, bw), (x, mean, sem, n) in pts.items():
 			any_pts = True
 			filled = bw is None
-			ax.scatter(x, mean, s=14, marker='o', lw=1.0,
-					   facecolors=col if filled else 'none', edgecolors=col,
-					   alpha=0.75, zorder=3)
-			if filled:
-				fx.append(x)
-				fy.append(mean)
-		fits[key] = _loglog_fit(ax, fx, fy, col)
+			ax.errorbar(x, mean, yerr=sem, fmt='o', ms=3.8, mew=1.0,
+						markerfacecolor=(col if filled else 'none'), markeredgecolor=col,
+						ecolor=col, elinewidth=0.7, capsize=0, alpha=0.85, zorder=3)
+			fx.append(x)                                 # fit uses plain AND permuted
+			fy.append(mean)
+		fits[key] = _loglog_fit(fx, fy)
+		if fits[key]:
+			fit_lines.append((fits[key], col))
 
 	if any_pts:
 		ax.set_xscale('log')
 		ax.set_yscale('log')
+	# draw each power-law fit across the full x-range, holding the data-driven limits
+	# so the lines span the whole plot (clipped to the box) without rescaling it
+	xlim, ylim = ax.get_xlim(), ax.get_ylim()
+	gx_full = np.array(xlim)
+	for (b, c), col in fit_lines:
+		ax.plot(gx_full, c * gx_full ** b, ls=':', lw=1.1, color=col, zorder=0)
+	ax.set_xlim(xlim)
+	ax.set_ylim(ylim)
 	ax.set_xlabel('Edges', fontsize=LABEL_FS)
 	ax.set_ylabel('Samples', fontsize=LABEL_FS)
 	_style_axis(ax)
@@ -640,18 +717,18 @@ def plot_samples_vs_edges(results, name):
 		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, mfc='none', label='permuted'),
 		Line2D([], [], color='0.35', ls=':', lw=1.1, label='fit'),
 	], loc='lower right')
-	# fit coefficients (plain points only) are recorded in the provenance, not here
+	# fit coefficients (all points) are recorded in the provenance, not here
 	return _save(fig, name), fits
 
 
 def plot_length_vs_Lmax(results, name):
 	"""
 	x = L_max (the DAG's longest path), y = smallest training length L reaching a
-	criterion, averaged over the seeds (runs). Criteria: illegal (blue) and
-	coverage (green), each with a dotted linear fit L = m * L_max + c. Grey 'x'
-	markers are the 95th-percentile path length L95 of each graph (the effective
-	max length: 95% of paths are shorter), with its own dotted fit -- comparing
-	the training length needed against the length the model must reconstruct.
+	criterion, averaged over the seeds (runs) with +/- SEM error bars. Criteria:
+	illegal (blue) and coverage (green), each with a dotted linear fit L = m * L_max
+	+ c. Grey 'x' markers are the 95th-percentile path length L95 of each graph (the
+	effective max length: 95% of paths are shorter), with its own dotted fit --
+	comparing the training length needed against the length the model must reconstruct.
 	"""
 	fig, ax = plt.subplots(figsize=(3, 2.5))
 	graphs = []
@@ -661,6 +738,7 @@ def plot_length_vs_Lmax(results, name):
 			graphs.append(g)
 
 	fits = {}
+	fit_lines = []          # (fit_params, color) to draw across the full x-range later
 	for key, col in [('minL_illegal', CURVE_COLORS[0]), ('minL_coverage', CURVE_COLORS[1])]:
 		fx, fy = [], []
 		for g in graphs:
@@ -669,23 +747,40 @@ def plot_length_vs_Lmax(results, name):
 			if not a:
 				continue
 			x = float(np.mean([r['L_max'] for r in group]))
-			ax.scatter(x, a[0], s=14, marker='o', color=col, alpha=0.75, zorder=3)
+			ax.errorbar(x, a[0], yerr=a[1], fmt='o', ms=3.8, color=col, alpha=0.85,
+						elinewidth=0.7, capsize=0, zorder=3)
 			fx.append(x)
 			fy.append(a[0])
-		fits[key] = _linear_fit(ax, fx, fy, col)
+		fits[key] = _linear_fit(fx, fy)
+		if fits[key]:
+			fit_lines.append((fits[key], col))
 
-	# 95th-percentile path length per graph (same for all its seeds), as 'x' markers
+	# 95th-percentile path length per graph, as 'x' markers (varies over seeds too now
+	# that each seed draws its own DAG, so it carries a SEM like the other points)
 	L95_COL = '0.4'
-	gx, gy = [], []
+	gx, gy, gyerr = [], [], []
 	for g in graphs:
 		group = [r for r in results if (r['V'], r['n']) == g and 'L95' in r]
 		if not group:
 			continue
+		l95 = np.array([r['L95'] for r in group], float)
 		gx.append(float(np.mean([r['L_max'] for r in group])))
-		gy.append(float(np.mean([r['L95'] for r in group])))
+		gy.append(float(l95.mean()))
+		gyerr.append(float(l95.std(ddof=1) / np.sqrt(len(l95))) if len(l95) > 1 else 0.0)
 	if gx:
-		ax.scatter(gx, gy, s=22, marker='x', color=L95_COL, lw=1.1, zorder=3)
-		fits['L95'] = _linear_fit(ax, gx, gy, L95_COL)
+		ax.errorbar(gx, gy, yerr=gyerr, fmt='x', ms=4, mew=1.1, color=L95_COL,
+					elinewidth=0.7, capsize=0, zorder=3)
+		fits['L95'] = _linear_fit(gx, gy)
+		if fits['L95']:
+			fit_lines.append((fits['L95'], L95_COL))
+
+	# draw each fit across the full x-range, holding the data-driven limits so the
+	# lines span the whole plot without expanding the axes
+	xlim = ax.get_xlim()
+	gx_full = np.array(xlim)
+	for (m, c), col in fit_lines:
+		ax.plot(gx_full, m * gx_full + c, ls=':', lw=1.1, color=col, zorder=1)
+	ax.set_xlim(xlim)
 
 	ax.set_xlabel(r'$L_{\max}$', fontsize=LABEL_FS)
 	ax.set_ylabel('Training Length', fontsize=LABEL_FS)
@@ -723,7 +818,7 @@ def _write_provenance(name, kind, profile, ordering, results, fits=None):
 		runs_per_point=len(profile['seeds']),                  # each plotted point averages this many seeds
 		error_bars='none drawn; each point is the mean over the seeds',
 		seed_rules={
-			'dag_seed': 'fixed at 0 per graph, so the seeds are replicates on one DAG',
+			'dag_seed': 'equal to seed, so each seed draws a fresh DAG (spread reflects graph variability)',
 			'train_sampler_rng': '[seed, 1]', 'test_sampler_rng': '[seed, 2]',
 			'perm_seed': 'seed', 'weight_init + shuffle seed': 'TrainConfig.seed = seed',
 		},
@@ -739,7 +834,7 @@ def _write_provenance(name, kind, profile, ordering, results, fits=None):
 			fit_summary[label] = (None if not f else dict(
 				coefficient_c=f[1], exponent_b=f[0],
 				equation='y = %.6g * x^%.6g' % (f[1], f[0]),
-				fitted_over='plain (non-permuted, non-censored) points'))
+				fitted_over='all points (plain and permuted, non-censored)'))
 		experiment = dict(
 			description='experiment 1: uniform paths (ReasoningGenerator.sample); '
 						'samples to reach a criterion vs distinct transitions',
@@ -804,8 +899,10 @@ def build_samples_vs_edges(profile, ordering, devices, force, name):
 	print(f"[{name}] saved {path}.pdf/.png (+ {name}.json, {name}_provenance.json)")
 
 
-def build_length_vs_Lmax(profile, ordering, devices, force, name):
-	jobs = [dict(profile=profile, ordering=ordering, graph=tuple(g), seed=seed)
+def build_length_vs_Lmax(profile, ordering, devices, force, name, windowed=False,
+						 augmented=False, hint_index=0):
+	jobs = [dict(profile=profile, ordering=ordering, graph=tuple(g), seed=seed,
+				 windowed=windowed, augmented=augmented)
 			for g in profile['graphs']
 			for seed in profile['seeds']]
 	print(f"[{name}] {len(jobs)} units")
@@ -813,7 +910,14 @@ def build_length_vs_Lmax(profile, ordering, devices, force, name):
 	os.makedirs(FIG_DIR, exist_ok=True)
 	with open(os.path.join(FIG_DIR, name + '.json'), 'w') as f:
 		json.dump(results, f, indent=1)
-	path, fits = plot_length_vs_Lmax(results, name)
+	# hint_index k > 0 re-plots the same (shared) units with k free hints per path,
+	# by swapping in the k-th slice of each unit's stored hint curve
+	if hint_index:
+		plot_results = [dict(r, minL_illegal=r['minL_illegal_by_hints'][hint_index],
+							 minL_coverage=r['minL_coverage_by_hints'][hint_index]) for r in results]
+	else:
+		plot_results = results
+	path, fits = plot_length_vs_Lmax(plot_results, name)
 	_write_provenance(name, 'length', profile, ordering, results, fits=fits)
 	print(f"[{name}] saved {path}.pdf/.png (+ {name}.json, {name}_provenance.json)")
 
@@ -823,6 +927,14 @@ FIGURES = {
 	'length_vs_Lmax': lambda p, d, f: build_length_vs_Lmax(p, 'random', d, f, 'length_vs_Lmax'),
 	'samples_vs_edges_digit_sum': lambda p, d, f: build_samples_vs_edges(p, 'digit_sum', d, f, 'samples_vs_edges_digit_sum'),
 	'length_vs_Lmax_digit_sum': lambda p, d, f: build_length_vs_Lmax(p, 'digit_sum', d, f, 'length_vs_Lmax_digit_sum'),
+	# windowed (local) attention: length generalisation with a sliding window of width n
+	'length_vs_Lmax_windowed': lambda p, d, f: build_length_vs_Lmax(p, 'random', d, f, 'length_vs_Lmax_windowed', windowed=True),
+	'length_vs_Lmax_windowed_digit_sum': lambda p, d, f: build_length_vs_Lmax(p, 'digit_sum', d, f, 'length_vs_Lmax_windowed_digit_sum', windowed=True),
+	# position-augmented training: random non-contiguous RoPE position gaps on the short paths
+	'length_vs_Lmax_augmented': lambda p, d, f: build_length_vs_Lmax(p, 'random', d, f, 'length_vs_Lmax_augmented', augmented=True),
+	'length_vs_Lmax_augmented_digit_sum': lambda p, d, f: build_length_vs_Lmax(p, 'digit_sum', d, f, 'length_vs_Lmax_augmented_digit_sum', augmented=True),
+	# the k-hint length figure is produced via `--hints k` (build_length_vs_Lmax with
+	# hint_index=k), reusing the shared length units -- no separate FIGURES entry.
 }
 
 
@@ -843,21 +955,60 @@ def main():
 					help="comma-separated subset of: " + ', '.join(FIGURES))
 	ap.add_argument('--digit-sum', action='store_true',
 					help="also make the digit-sum-ordering figures (off by default)")
+	ap.add_argument('--windowed-attention', action='store_true',
+					help="also repeat length_vs_Lmax with sliding-window (local) "
+						 "attention of width n (off by default)")
+	ap.add_argument('--augmented', action='store_true',
+					help="also repeat length_vs_Lmax with random RoPE position "
+						 "augmentation on the short training paths (off by default)")
+	ap.add_argument('--hints', type=int, default=0, metavar='K',
+					help=f"make length_vs_Lmax_Khints: the length figure with K free "
+						 f"ground-truth hints per path (K <= {HINT_MAX}); reuses the shared "
+						 f"length units, so it never retrains. Alone, only this figure is built")
+	ap.add_argument('--workers', type=int, default=None, metavar='N',
+					help="parallel worker processes for the unit sweep (default: one per "
+						 "device). Since the work is CPU-bound and the models tiny, N > #devices "
+						 "packs several units per GPU and speeds up the CPU parts; each unit is "
+						 "still computed once, so there is no redundant recomputation")
 	ap.add_argument('--force', action='store_true', help="recompute, ignoring the unit cache")
 	args = ap.parse_args()
+
+	if args.hints < 0 or args.hints > HINT_MAX:
+		ap.error(f"--hints must be between 0 and HINT_MAX={HINT_MAX} "
+				 f"(raise HINT_MAX in run_experiments.py for more)")
+	if args.workers is not None and args.workers < 1:
+		ap.error("--workers must be >= 1")
+
+	global _N_WORKERS
+	_N_WORKERS = args.workers
 
 	profile_name = args.profile or ('full' if torch.cuda.is_available() else 'laptop')
 	profile = PROFILES[profile_name]
 	devices = args.devices.split(',') if args.devices else _default_devices()
 	if args.figures:                            # explicit subset overrides everything
 		names = args.figures.split(',')
-	else:                                       # random ordering only, unless --digit-sum
-		names = [f for f in FIGURES if args.digit_sum or not f.endswith('_digit_sum')]
+	else:                                       # gate the optional families behind flags
+		names = [f for f in FIGURES
+				 if (args.digit_sum or not f.endswith('_digit_sum'))
+				 and (args.windowed_attention or '_windowed' not in f)
+				 and (args.augmented or '_augmented' not in f)]
 
-	print(f"profile={profile_name} devices={devices} figures={names}")
+	# --hints K *adds* the K-hint length figure(s) on top of the selection above,
+	# reusing the shared length units (no retrain). One per active ordering, so
+	# --digit-sum also yields the digit-sum hint figure.
+	hint_figs = []
+	if args.hints:
+		for ordering in ['random'] + (['digit_sum'] if args.digit_sum else []):
+			suffix = '' if ordering == 'random' else '_digit_sum'
+			hint_figs.append((ordering, f'length_vs_Lmax_{args.hints}hints{suffix}'))
+
+	print(f"profile={profile_name} devices={devices} figures={names}"
+		  + (f" +{[h[1] for h in hint_figs]}" if hint_figs else ""))
 	t0 = time.time()
 	for name in names:
 		FIGURES[name](profile, devices, args.force)
+	for ordering, name in hint_figs:
+		build_length_vs_Lmax(profile, ordering, devices, args.force, name, hint_index=args.hints)
 	print(f"done in {time.time() - t0:.1f}s")
 
 

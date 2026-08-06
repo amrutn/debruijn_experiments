@@ -530,7 +530,8 @@ class MultiHead_Attention(nn.Module):
 		else:
 			self.rope = lambda x,y: x
 
-	def forward(self, x : torch.Tensor) -> torch.Tensor:
+	def forward(self, x : torch.Tensor, attn_mask : torch.Tensor | None = None,
+				token_positions : torch.Tensor | None = None) -> torch.Tensor:
 		"""
 		Apply multi-head attention to an input tensor
 
@@ -538,6 +539,14 @@ class MultiHead_Attention(nn.Module):
 		------
 		x : torch.Tensor
 			Input tensor of shape [batch, seq_len, d_model]
+		attn_mask : torch.Tensor | None
+			Optional boolean (seq_len, seq_len) mask (True = attend). If None, the
+			usual causal mask is used. A sliding-window mask is passed here to
+			restrict each query to a fixed number of recent positions.
+		token_positions : torch.Tensor | None
+			Optional RoPE positions, shape (seq_len,) or per-sample (batch, seq_len).
+			None means the usual 0, 1, ..., seq_len-1. Non-contiguous positions are
+			passed here to augment training with random inter-token gaps.
 		Returns
 		-------
 		out : torch.Tensor
@@ -554,15 +563,23 @@ class MultiHead_Attention(nn.Module):
 		values_combined = einx.dot("d_keys [d_model], batch seq_len [d_model] -> batch seq_len d_keys", self.W_V, x)
 		values = einx.id("batch seq_len (h d_k) -> batch h seq_len d_k", values_combined, h=self.num_heads)
 
-		# second apply rope
-		token_positions = torch.arange(x.size(-2), dtype=torch.long, device=self.device)
+		# second apply rope. Positions default to 0..seq_len-1; a caller may pass
+		# explicit positions (e.g. non-contiguous, for gap augmentation). Per-sample
+		# positions (batch, seq_len) get a head axis so they broadcast over heads.
+		if token_positions is None:
+			token_positions = torch.arange(x.size(-2), dtype=torch.long, device=self.device)
+		else:
+			token_positions = token_positions.to(device=self.device, dtype=torch.long)
+			if token_positions.dim() == 2:
+				token_positions = token_positions.unsqueeze(1)   # (batch, 1, seq_len)
 		embedded_keys = self.rope(keys, token_positions)
 		embedded_queries = self.rope(queries, token_positions)
 
 
-		# next compute the scaled dot product attention per head
-		# causal mask is automatically applied
-		attention_out = scaled_attention(embedded_keys, embedded_queries, values)
+		# next compute the scaled dot product attention per head. A plain causal
+		# mask is used unless a caller passes an explicit attn_mask (e.g. a
+		# sliding-window mask).
+		attention_out = scaled_attention(embedded_keys, embedded_queries, values, causal_mask=attn_mask)
 		# reshape to combine the heads
 		reshaped_attention = einx.id("batch h seq_len d_k -> batch seq_len (h d_k)", attention_out)
 
@@ -680,13 +697,18 @@ class Transformer_Block(nn.Module):
 							w3_weight=weights['ffn.w3.weight'],
 							dtype=dtype, device=device, rng=rng)
 
-	def forward(self, x : torch.Tensor) -> torch.Tensor:
+	def forward(self, x : torch.Tensor, attn_mask : torch.Tensor | None = None,
+				token_positions : torch.Tensor | None = None) -> torch.Tensor:
 		"""
 		Forward pass of the Transformer block
 		Params
 		------
 		x : torch.Tensor
 			Input tensor of shape (batch, seq_len, d_model)
+		attn_mask : torch.Tensor | None
+			Optional attention mask forwarded to the attention module.
+		token_positions : torch.Tensor | None
+			Optional RoPE positions forwarded to attention.
 		Returns
 		-------
 		out : torch.Tensor
@@ -694,7 +716,7 @@ class Transformer_Block(nn.Module):
 		"""
 
 		first_normed = self.norm1(x)
-		post_attn = self.attn(first_normed)
+		post_attn = self.attn(first_normed, attn_mask=attn_mask, token_positions=token_positions)
 
 		# add residual
 		first_residual = x + post_attn
@@ -828,13 +850,22 @@ class TransformerLM(nn.Module):
 									dtype=dtype, 
 									rng=rng)
 
-	def forward(self, x : torch.Tensor) -> torch.Tensor:
+	def forward(self, x : torch.Tensor, attn_mask : torch.Tensor | None = None,
+				token_positions : torch.Tensor | None = None) -> torch.Tensor:
 		"""
 		Forward pass of the model
 		Params
 		------
 		x : torch.Tensor
 			Sequence of integer token_ids of size (batch, seq_len)
+		attn_mask : torch.Tensor | None
+			Optional boolean (seq_len, seq_len) attention mask (True = attend),
+			applied in every transformer block. If None, plain causal attention
+			is used. A sliding-window mask is passed here for local attention.
+		token_positions : torch.Tensor | None
+			Optional RoPE positions, shape (seq_len,) or per-sample (batch, seq_len),
+			applied in every block. None means the usual 0, 1, ..., seq_len-1;
+			non-contiguous positions are passed here for gap augmentation.
 		Returns
 		-------
 		out : torch.Tensor
@@ -845,7 +876,7 @@ class TransformerLM(nn.Module):
 		# transformer blocks
 		curr_res = embedded
 		for block in self.transformer_blocks:
-			curr_res = block(curr_res)
+			curr_res = block(curr_res, attn_mask=attn_mask, token_positions=token_positions)
 		# post norm
 		post_normed = self.post_norm(curr_res)
 

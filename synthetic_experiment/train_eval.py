@@ -53,6 +53,11 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cache')
 # The default path ratio when computing the path_coverage metric
 DEFAULT_PATH_RATIO = 0.1
 
+# Position augmentation (train_one_epoch, augment=True) uses randomized positional
+# encodings (Ruoss et al. 2023): each sequence is given a random strictly-increasing
+# subset of positions spanning [0, pos_cap], so even short training paths exhibit the
+# full range of relative distances (up to ~L_max) that only long paths would produce.
+
 
 @dataclass
 class ModelConfig:
@@ -399,7 +404,35 @@ def training_visits(chars, lengths, dag):
 # training (one epoch)
 # ----------------------------------------------------------------------------
 
-def train_one_epoch(model, full_tokens, lengths, n, tcfg):
+def window_mask(seq_len, window, device):
+	"""
+	Build a boolean sliding-window causal mask for `model(..., attn_mask=...)`.
+
+	Params
+	------
+	seq_len : int
+		Query/key sequence length.
+	window : int | None
+		Width of the local attention window. Position i attends to positions
+		(i-window, i]. If None, returns None (plain causal attention).
+	device : torch.device
+		Device for the mask.
+
+	Returns
+	-------
+	torch.Tensor | None
+		Boolean (seq_len, seq_len) mask (True = attend), or None if `window` is
+		None.
+	"""
+	if window is None:
+		return None
+	idx = torch.arange(seq_len, device=device)
+	delta = idx[:, None] - idx[None, :]
+	return (delta >= 0) & (delta < window)
+
+
+def train_one_epoch(model, full_tokens, lengths, n, tcfg, window=None, augment=False,
+					pos_cap=None):
 	"""
 	Train `model` for exactly one pass over the data.
 
@@ -420,6 +453,20 @@ def train_one_epoch(model, full_tokens, lengths, n, tcfg):
 		n-gram length (determines the first predicted position, n-1).
 	tcfg : TrainConfig
 		Optimisation settings (lr, batch_size, device, seed, ...).
+	window : int | None
+		If set, train with sliding-window (local) attention of this width via an
+		attn_mask; None uses full causal attention.
+	augment : bool
+		If True, softened position augmentation: keep the sequence contiguous but
+		insert ONE random gap per path before its last n tokens, shifting later
+		tokens (and padding) up by the gap size. This exposes deep positions while
+		leaving each state's local n-gram window contiguous (only the ~n windows
+		straddling the gap are disturbed). Real positions stay <= pos_cap; paths are
+		never truncated. Evaluation always uses natural contiguous positions.
+	pos_cap : int | None
+		Largest position the *real* tokens may reach: the deepest position a full
+		(L_max) path reaches. Padding may run past it (hence the enlarged RoPE cache
+		in _train_short_test_full). None falls back to natural 0..seq_len-1.
 
 	Returns
 	-------
@@ -436,6 +483,7 @@ def train_one_epoch(model, full_tokens, lengths, n, tcfg):
 	lt = torch.from_numpy(np.asarray(lengths, dtype=np.int64))
 	num, K = full_tokens.shape
 	pos = torch.arange(K - 1)
+	attn_mask = window_mask(K - 1, window, device)
 
 	g = torch.Generator().manual_seed(int(tcfg.seed))
 	order = torch.randperm(num, generator=g)
@@ -444,11 +492,32 @@ def train_one_epoch(model, full_tokens, lengths, n, tcfg):
 	for s in range(0, num, tcfg.batch_size):
 		idx = order[s:s + tcfg.batch_size]
 		batch = ft[idx].to(device)
-		blen = lt[idx].to(device)
+		blen_cpu = lt[idx]
+		blen = blen_cpu.to(device)
 
 		inp = batch[:, :-1]
 		tgt = batch[:, 1:]
-		logits = model(inp)                      # (b, K-1, vocab)
+		token_positions = None
+		if augment:
+			# Softened augmentation: keep tokens mostly contiguous (so each state's
+			# local n-gram window stays intact) but insert ONE random gap per path,
+			# placed strictly before the last n tokens. Tokens after the gap -- and
+			# the trailing padding -- shift up by the gap size, so the path still
+			# reaches deep positions while only the ~n windows straddling the gap are
+			# disturbed; the last-n read is always contiguous. Real positions stay
+			# <= pos_cap; padding may run past it (the RoPE cache is sized for it).
+			b, W = idx.numel(), K - 1
+			cap = pos_cap if pos_cap is not None else W - 1
+			slot = torch.arange(W)
+			budget = (cap - (blen_cpu - 1)).clamp(min=0)         # room to grow (keeps real <= cap)
+			hi = (blen_cpu - n).clamp(min=0)                     # last split that keeps last n contiguous
+			has_jump = hi >= 1
+			s = (torch.rand(b, generator=g) * hi.float()).floor().long() + 1        # split slot in [1, hi]
+			jump = (torch.rand(b, generator=g) * (budget + 1).float()).floor().long()  # gap size in [0, budget]
+			jump = torch.where(has_jump, jump, torch.zeros_like(jump))
+			s = torch.where(has_jump, s, torch.full_like(s, W + 1))                 # no eligible split -> no shift
+			token_positions = (slot[None, :] + (slot[None, :] >= s[:, None]).long() * jump[:, None]).to(device)
+		logits = model(inp, attn_mask=attn_mask, token_positions=token_positions)  # (b, K-1, vocab)
 
 		mask = (pos.to(device)[None, :] >= n - 1) & (pos.to(device)[None, :] <= blen[:, None] - 1)
 		loss = F.cross_entropy(logits[mask], tgt[mask])
@@ -467,10 +536,52 @@ def train_one_epoch(model, full_tokens, lengths, n, tcfg):
 # evaluation
 # ----------------------------------------------------------------------------
 
+def _drop_extreme_per_path(values, path_idx, num_paths, k, largest):
+	"""
+	Per path, drop the `k` most extreme values and return the kept sum and count.
+
+	`largest=True` drops the k largest values in each path (used to give the
+	illegal_mass metric `k` free hints at its worst states); `largest=False` drops
+	the k smallest (used to drop the k lowest log p_model/p_true terms from the
+	path-probability product). Paths with <= k states keep nothing.
+
+	Params
+	------
+	values : (S,) float array
+		One value per prediction state.
+	path_idx : (S,) int array
+		Path index in [0, num_paths) that each state belongs to.
+	num_paths : int
+	k : int
+		Number of hints (extreme values to drop) per path.
+	largest : bool
+		Drop the k largest (True) or k smallest (False) per path.
+
+	Returns
+	-------
+	(kept_sum, kept_count) : two (num_paths,) arrays
+		Sum and count of the values remaining in each path after dropping.
+	"""
+	counts = np.bincount(path_idx, minlength=num_paths)
+	total = np.bincount(path_idx, weights=values, minlength=num_paths)
+	if k <= 0:
+		return total, counts.astype(float)
+	sign = -1.0 if largest else 1.0
+	order = np.lexsort((sign * values, path_idx))          # by path, then value
+	sp, sv = path_idx[order], values[order]
+	gstart = np.zeros(num_paths, dtype=np.int64)
+	gstart[1:] = np.cumsum(counts)[:-1]                    # first slot of each path
+	rank = np.arange(len(order)) - gstart[sp]              # within-path rank (extreme first)
+	drop = rank < k
+	dsum = np.bincount(sp[drop], weights=sv[drop], minlength=num_paths)
+	dcnt = np.bincount(sp[drop], minlength=num_paths)
+	return total - dsum, (counts - dcnt).astype(float)
+
+
 @torch.no_grad()
 def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 			 seen_states=None, true_branch_p=None, path_ratio=DEFAULT_PATH_RATIO,
-			 device=None, batch_size=512):
+			 device=None, batch_size=512, window=None, num_hints=0):
 	"""
 	Compute illegal_mass (and optionally path_coverage) on a test set.
 
@@ -512,6 +623,17 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 		Device to run the model on; None auto-selects (see `resolve_device`).
 	batch_size : int
 		Number of sequences scored per forward pass.
+	window : int | None
+		If set, evaluate with sliding-window (local) attention of this width;
+		should match the window used during training.
+	num_hints : int
+		If > 0, also report `illegal_mass_by_hints` / `path_coverage_by_hints`:
+		length-(num_hints+1) lists giving each metric when every path is granted
+		k = 0, 1, ..., num_hints free ground-truth "hints" placed at its worst
+		positions (dropping the k highest illegal-mass states for illegal_mass, and
+		the k lowest log p_model/p_true terms from the path-probability product for
+		coverage). Index 0 equals the un-hinted metric; higher indices need no
+		retraining -- one evaluation yields the whole hint curve.
 
 	Returns
 	-------
@@ -546,17 +668,21 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 	node_at = _node_values(orig_chars, n, V)
 	lengths = np.asarray(lengths)
 	pos = np.arange(K - 1)
+	attn_mask = window_mask(K - 1, window, device)
 
 	illegal_all, state_seen_all = [], []
 	tot_legal = 0
 	# per-path log-probability of the actual path, under the model and the truth
 	logp_model = np.zeros(num) if true_branch_p is not None else None
 	logp_true = np.zeros(num) if true_branch_p is not None else None
+	# for the hint metrics: per-state path index, and per-state log(p_model/p_true)
+	pidx_all = [] if num_hints else None
+	d_all = [] if (num_hints and true_branch_p is not None) else None
 
 	for s in range(0, num, batch_size):
 		e = min(num, s + batch_size)
 		binp = torch.from_numpy(full[s:e, :K - 1]).to(device)
-		logits = model(binp)
+		logits = model(binp, attn_mask=attn_mask)
 		probs = torch.softmax(logits.float(), dim=-1).cpu().numpy()
 
 		blen = lengths[s:e]
@@ -583,6 +709,8 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 		illegal = (op * (~legal)).sum(axis=1)
 		tot_legal += int(legal.sum())
 		illegal_all.append(illegal)
+		if pidx_all is not None:
+			pidx_all.append(s + rows)                 # path index of each state
 
 		if seen_states is not None:
 			state_seen_all.append(seen_states[u])
@@ -597,8 +725,11 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 			correct[br] = orig_chars[gr[br], j[br]]
 			p_model = op[np.arange(len(rows)), correct]
 			p_true = true_branch_p[u, correct]
+			logd = np.log(p_model + 1e-30) - np.log(p_true + 1e-30)
 			np.add.at(logp_model, gr, np.log(p_model + 1e-30))
 			np.add.at(logp_true, gr, np.log(p_true + 1e-30))
+			if d_all is not None:
+				d_all.append(logd)                    # per-state log(p_model/p_true)
 
 	illegal_all = np.concatenate(illegal_all) if illegal_all else np.zeros(0)
 	res = {
@@ -613,6 +744,26 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 	if true_branch_p is not None:
 		covered = (logp_model - logp_true) >= math.log(path_ratio)
 		res['path_coverage'] = float(covered.mean()) if num else float('nan')
+	# hint metrics: for k = 0 .. num_hints, give each path k free ground-truth
+	# positions placed at its worst states and recompute the metric on what remains
+	# -- separately for illegal_mass (drop k highest-illegal states) and coverage
+	# (drop the k lowest log p_model/p_true terms). Index k == 0 is the baseline, so
+	# `illegal_mass_by_hints[0]` == illegal_mass and `path_coverage_by_hints[0]` ==
+	# path_coverage; slice k to read the k-hint result without recomputing.
+	if num_hints and len(illegal_all):
+		pidx = np.concatenate(pidx_all)
+		d = np.concatenate(d_all) if d_all is not None else None
+		im_bh, cov_bh = [], []
+		for k in range(num_hints + 1):
+			ks, kc = _drop_extreme_per_path(illegal_all, pidx, num, k, largest=True)
+			tot = float(kc.sum())
+			im_bh.append(float(ks.sum() / tot) if tot else float('nan'))
+			if d is not None:
+				kd, _ = _drop_extreme_per_path(d, pidx, num, k, largest=False)
+				cov_bh.append(float((kd >= math.log(path_ratio)).mean()) if num else float('nan'))
+		res['illegal_mass_by_hints'] = im_bh
+		if d is not None:
+			res['path_coverage_by_hints'] = cov_bh
 	return res
 
 
