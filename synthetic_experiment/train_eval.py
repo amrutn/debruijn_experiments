@@ -447,9 +447,8 @@ def train_one_epoch(model, full_tokens, lengths, n, tcfg, window=None, augment=F
 		If set, train with sliding-window (local) attention of this width via an
 		attn_mask; None uses full causal attention.
 	augment : bool
-		If True, softened position augmentation: keep the sequence contiguous but
-		insert ONE random gap per path before its last n tokens, shifting later
-		tokens (and padding) up by the gap size. This exposes deep positions while
+		If True, position augmentation: Insert ONE random gap per path before its last n tokens,
+		shifting later tokens (and padding) up by the gap size. This exposes deep positions while
 		leaving each state's local n-gram window contiguous (only the ~n windows
 		straddling the gap are disturbed). Real positions stay <= pos_cap; paths are
 		never truncated. Evaluation always uses natural contiguous positions.
