@@ -309,33 +309,66 @@ MCQ_INSTRUCTION = ('Please reason step by step, then give your final answer as t
 				   'single letter of the correct option within \\boxed{}.')
 
 # Non-reasoning control prompts for the 'baseline' benchmark: open-ended creative
-# and descriptive tasks with no correct answer, to contrast the entropy dynamics
-# of free generation against those of the reasoning benchmarks.
+# and descriptive tasks with no correct answer. They deliberately ask for
+# long-form output (extended stories, descriptions, letters, narrative poems) so
+# the generations are comparable in length to the reasoning traces, letting the
+# entropy-vs-token curves be compared over the same span.
 BASELINE_PROMPTS = [
-	'Write a poem about the ocean at dawn.',
-	'Write a short poem about an old wooden chair.',
-	'Write a haiku about falling snow.',
-	'Write a limerick about a forgetful cat.',
-	'Write a short bedtime story about a lighthouse keeper.',
-	'Write the opening paragraph of a mystery novel set on a train.',
-	'Write a short story about a robot who discovers gardening.',
-	'Describe a bustling morning market using vivid sensory detail.',
-	'Describe the feeling of walking into a warm house on a cold night.',
-	'Describe an imaginary city floating among the clouds.',
-	'Write a friendly letter to a pen pal who lives on the coast.',
-	'Write a thank-you note to a teacher who inspired you.',
-	'Write a postcard message from a seaside holiday.',
-	'Write a short dialogue between the sun and the moon.',
-	'Write a whimsical product description for a jar of bottled starlight.',
-	'Write a toast for a friend celebrating a new job.',
-	'Compose a lullaby about sleepy woodland animals.',
-	'Write a short fairy tale about a kind-hearted dragon.',
-	'Describe your ideal cozy reading nook.',
-	'Write a playful ode to a cup of morning coffee.',
-	'Write a brief travelogue entry about a quiet mountain village.',
-	'Write a short monologue for a wandering street musician.',
-	'Describe a garden as it changes through the four seasons.',
-	'Write a gentle poem about growing older.',
+	'Write a detailed short story of at least 2000 words about a lighthouse '
+	'keeper who befriends a stranded sailor over the course of a long winter.',
+	'Write a long, multi-chapter fairy tale about a kind-hearted dragon who sets '
+	'out to return stolen rain to a drought-stricken kingdom.',
+	'Write an extensive, richly detailed description of a bustling morning market '
+	'in a coastal town, covering the sights, sounds, smells, and people from '
+	'before dawn until midday.',
+	'Compose a long narrative poem of at least 100 lines telling the story of a '
+	'river from its mountain source to the sea.',
+	'Write a detailed travelogue of about 1800 words describing a week spent '
+	'wandering through a quiet mountain village.',
+	'Write a long short story of around 2500 words about a robot who slowly '
+	'discovers a love of gardening and, through it, comes to understand the '
+	'people of its town.',
+	'Write an extended, immersive description of an imaginary city floating among '
+	'the clouds: its architecture, its people, their daily lives, festivals, and '
+	'the myths they tell.',
+	'Write a long letter of at least 1500 words from a grandparent recounting the '
+	'story of their life to a grandchild they have never met.',
+	'Write a detailed, multi-part bedtime story about a family of foxes preparing '
+	'their burrow for a long winter, told over several nights.',
+	'Write an extensive worldbuilding account of a peaceful island civilization: '
+	'its geography, seasons, cuisine, crafts, music, and folklore.',
+	'Write a long descriptive essay of about 1800 words on the changing moods of '
+	'the sea throughout a single day, from dawn to midnight.',
+	'Write a lengthy diary spanning a month in the life of a small-town baker, '
+	'with an entry for many of the days.',
+	'Write a richly detailed short story of around 2000 words about a traveling '
+	'street musician who arrives in a new city and changes the lives of the '
+	'people who hear their songs.',
+	'Write an extended fairy tale, in several chapters, about two siblings who '
+	'journey across a land of endless autumn to find the last blooming tree.',
+	'Write a detailed, sensory-rich description of a grand old library at night: '
+	'its rooms, its books, the light, the silence, and the imagined lives within '
+	'its stories.',
+	'Write a long narrative poem of at least 120 lines chronicling the seasons of '
+	'a single ancient oak and the creatures who live around it.',
+	'Write an extensive account of about 1800 words of a day in the life of a '
+	'small alpine inn during a snowstorm, told from the perspective of the '
+	'innkeeper.',
+	'Write a long, whimsical story of around 2000 words about a shop that sells '
+	'bottled feelings and the many customers who come through its door in a week.',
+	'Write a detailed, multi-scene story about a garden that quietly transforms '
+	'through all four seasons, and the elderly couple who tend it.',
+	'Write a long letter of at least 1500 words from an explorer to their family '
+	'back home, describing the strange and beautiful lands they have discovered.',
+	'Write an extended, immersive description of a seaside holiday town waking up, '
+	'going about its day, and settling into evening, following several different '
+	'residents.',
+	'Write a long fable, in several parts, about a wandering tortoise who collects '
+	'stories from every animal it meets on a year-long journey.',
+	'Write a detailed short story of around 2500 words about a night train '
+	'crossing a continent and the intertwining lives of the passengers aboard.',
+	'Write an extensive, gentle meditation of about 1800 words on growing older, '
+	'told through the changing view from one kitchen window across many decades.',
 ]
 
 
