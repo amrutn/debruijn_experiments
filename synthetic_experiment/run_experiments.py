@@ -996,7 +996,7 @@ def build_samples_vs_edges(profile, ordering, devices, force, name):
 	os.makedirs(FIG_DIR, exist_ok=True)
 	with open(os.path.join(FIG_DIR, name + '.json'), 'w') as f:
 		json.dump(results, f, indent=1)
-	path, fits = plot_samples_vs_edges(results, name, fit_plain_only=True)
+	path, fits = plot_samples_vs_edges(results, name, fit_plain_only=False)
 	write_provenance(name, 'samples', profile, ordering, results, fits=fits)
 	print(f"[{name}] saved {path}.pdf/.png (+ {name}.json, {name}_provenance.json)")
 
