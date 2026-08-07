@@ -1,11 +1,18 @@
 # Combined conda environment for the whole project:
 #   - theory/                (theorem1_theorem2.py, theorem3.py, debruijn_dag_figure.py)
 #   - synthetic_experiment/  (generate_data.py, model.py, train_eval.py, run_experiments.py)
+#   - benchmarks/            (entropy_vs_time.py)
 #
 # theory needs numpy / scipy / matplotlib / networkx / numba; the synthetic
 # experiment additionally needs torch and einx. torch and einx are installed
 # via pip so the platform-appropriate build is selected automatically -- CUDA
 # on the Linux cluster (the 2x4090 run), MPS on Apple Silicon.
+#
+# The benchmarks entropy experiment (entropy_vs_time.py) serves local Qwen models
+# with vLLM and needs datasets / transformers; math-verify gives stricter math
+# grading. vLLM ships CUDA-only wheels: it installs on the Linux GPU box but NOT
+# on Apple Silicon -- comment out the vllm line below to build the env on macOS
+# (the --plot-only path, which just redraws figures from cache, needs no vLLM).
 #
 # Create with:  conda env create -f environment.yml
 # Update with:  conda env update -f environment.yml --prune
@@ -25,5 +32,10 @@ dependencies:
   - tqdm>=4.60           # progress bars for run_experiments.py
   - pip>=23
   - pip:
-      - torch>=2.2       # CUDA build on Linux, MPS build on macOS
-      - einx>=0.4        # not packaged on conda-forge, so installed via pip
+      - torch>=2.2         # CUDA build on Linux, MPS build on macOS
+      - einx>=0.4          # not packaged on conda-forge, so installed via pip
+      # benchmarks/entropy_vs_time.py:
+      - vllm>=0.8.5        # local model serving + top-k logprobs; CUDA-only (skip on macOS)
+      - transformers>=4.51 # >=4.51 for the Qwen3 chat templates / architectures
+      - datasets>=2.19     # loads the reasoning benchmarks from the Hub
+      - math-verify>=0.5   # optional: stricter semantics-aware math answer grading
