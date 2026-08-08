@@ -1,7 +1,7 @@
 """
-Measure and plot the token-level predictive entropy of a Qwen reasoning model as
+Measure and plot the next-token entropy of Qwen reasoning models as
 a function of position in its own generated chain-of-thought ("entropy vs time"),
-across several reasoning benchmarks, using only local NVIDIA GPUs.
+across several reasoning benchmarks.
 
 What is measured
 ----------------
@@ -9,12 +9,12 @@ For a prompt, the model autoregressively generates a reasoning trace (thinking +
 answer). At every generated position t the decoder induces a next-token
 distribution p_t over the vocabulary; its Shannon entropy
 
-    H_t = - sum_v p_t(v) log p_t(v)
+    H_t = - sum_v p_t(v) log2 p_t(v)
 
 quantifies how uncertain the model is at that step. We collect H_t for many
 samples and problems and plot the mean H_t (with a shaded standard-error band)
 against t. High early entropy that collapses over the trace, or entropy that
-stays elevated on failures, are the kinds of effects this figure is meant to
+stays elevated on failures, are the kinds of effects this experiment is meant to
 expose.
 
 vLLM only returns the top-`logprobs_k` logprobs per step (the tail is not
@@ -1068,6 +1068,9 @@ def build_engine(model_spec, args):
 		gpu_memory_utilization=args.gpu_mem_util,
 		enforce_eager=False,
 		trust_remote_code=True,
+		# custom all-reduce misbehaves on NVLink-less GPUs (e.g. RTX 4090); use
+		# the standard NCCL path instead (also silences vLLM's warning)
+		disable_custom_all_reduce=True,
 	)
 
 
@@ -1566,7 +1569,9 @@ def parse_args(argv=None):
 	p.add_argument('--entropy-base', type=float, default=2.0, help='log base (2 -> bits, e -> nats)')
 	p.add_argument('--renormalize', action='store_true',
 				   help='renormalise top-k probs before computing entropy')
-	p.add_argument('--gpu-mem-util', type=float, default=0.90, help='vLLM gpu_memory_utilization')
+	p.add_argument('--gpu-mem-util', type=float, default=0.85,
+				   help='vLLM gpu_memory_utilization; leaves headroom for the '
+						'sampler/logprobs buffers (lower to ~0.80 if you still OOM)')
 	p.add_argument('--devices', nargs='+', default=None, metavar='cuda:N',
 				   help='GPUs to use, e.g. --devices cuda:0 cuda:1 cuda:2 cuda:3 '
 						'(bare indices like 0 1 also accepted). Sets '
@@ -1600,6 +1605,13 @@ def main(argv=None):
 	# unaffected by any CUDA/torch state in this parent (fork + CUDA is unsafe).
 	# setdefault lets an explicit VLLM_WORKER_MULTIPROC_METHOD override this.
 	os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
+	# NVLink-less GPUs (e.g. RTX 4090) lack working peer-to-peer, which breaks
+	# NCCL and vLLM's custom all-reduce for tensor parallelism -- route the
+	# collectives the standard way. expandable_segments reduces allocator
+	# fragmentation so the sampler's transient buffers fit next to the KV cache.
+	os.environ.setdefault('NCCL_P2P_DISABLE', '1')
+	os.environ.setdefault('NCCL_IB_DISABLE', '1')
+	os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 	# device selection must happen before any CUDA context is created
 	n_visible = configure_devices(args.devices)
 	set_seed(args.seed)
