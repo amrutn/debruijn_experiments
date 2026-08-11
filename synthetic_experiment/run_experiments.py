@@ -719,7 +719,7 @@ def plot_samples_vs_edges(results, name, fit_plain_only=False):
 	ax.set_ylabel('Samples', fontsize=LABEL_FS)
 	_style_axis(ax)
 	crit = _legend(ax, [
-		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$P($invalid token$) < 0.05$'),
+		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$P($invalid tokens$) < 0.05$'),
 		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label=r'path coverage $> 0.95$'),
 	], loc='upper left')
 	ax.add_artist(crit)
@@ -828,7 +828,7 @@ def plot_sample_efficiency_vs_edges(results, name, mincover):
 	_style_axis(ax)
 	# both legends stacked at the top-left (criteria on top, plain/permuted below)
 	crit = _legend(ax, [
-		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$P($invalid token$) < 0.05$'),
+		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$P($invalid tokens$) < 0.05$'),
 		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label=r'path coverage $>0.95$'),
 	], loc='upper left')
 	ax.add_artist(crit)
@@ -908,7 +908,7 @@ def plot_length_vs_Lmax(results, name):
 	ax.set_ylabel('Length', fontsize=LABEL_FS)
 	_style_axis(ax)
 	_legend(ax, [
-		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$L_{\text{train}}$: $P($illegal token$) < 0.05$'),
+		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$L_{\text{train}}$: $P($invalid tokens$) < 0.05$'),
 		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label=r'$L_{\text{train}}$: path coverage $> 0.95$'),
 		Line2D([], [], color=COV_COL, marker='D', ls='', ms=3.5, label='longest learned path'),
 		Line2D([], [], color='0.35', ls='-', lw=1.6, label='fit'),
