@@ -70,7 +70,7 @@ from generate_data import build_dag, ReasoningGenerator
 from train_eval import (
 	ModelConfig, TrainConfig, resolve_device, run_experiment_1,
 	build_model, train_one_epoch, evaluate, training_visits, build_full_tokens,
-	_DTYPES, DEFAULT_PATH_RATIO,
+	_load_or_train, _DTYPES, DEFAULT_PATH_RATIO,
 )
 
 
@@ -144,7 +144,7 @@ def _style_axis(ax):
 
 
 def _legend(ax, handles, loc='lower right', bbox=None):
-	leg = ax.legend(handles=handles, fontsize=LEGEND_FS, frameon=True,
+	leg = ax.legend(handles=handles, fontsize=LEGEND_FS, frameon=False,
 					loc=loc, bbox_to_anchor=bbox, borderaxespad=0.15, handlelength=1.6,
 					labelspacing=0.25, handletextpad=0.5)
 	leg.set_zorder(20)
@@ -408,7 +408,7 @@ def samples_unit(profile, ordering, graph, bin_width, seed, device, force):
 
 def _train_short_test_full(V, n, S, N, L, num_train, num_test, ordering,
 						   dag_seed, seed, mcfg, tcfg, epochs, window=None, augment=False,
-						   num_hints=0):
+						   num_hints=0, force=False):
 	"""
 	Train on paths of <= L edges (for `epochs` passes), evaluate on the full path
 	distribution. Returns (metrics, dag). If `window`, use sliding-window attention of that width.
@@ -433,10 +433,29 @@ def _train_short_test_full(V, n, S, N, L, num_train, num_test, ordering,
 	max_seq_len = gen.max_chars + 1                 # cover the (longer) full-path test set
 	if augment:
 		max_seq_len = gen.max_chars + train_full.shape[1]
-	model = build_model(V + 1, max_seq_len, mcfg, device, dtype, tcfg.seed)
-	for e in range(epochs):                          # reshuffle each epoch
-		train_one_epoch(model, train_full, train_len, n, replace(tcfg, seed=tcfg.seed + e),
-						window=window, augment=augment, pos_cap=pos_cap)
+
+	def factory():
+		return build_model(V + 1, max_seq_len, mcfg, device, dtype, tcfg.seed)
+
+	def train_fn(model):
+		for e in range(epochs):                      # reshuffle each epoch
+			train_one_epoch(model, train_full, train_len, n, replace(tcfg, seed=tcfg.seed + e),
+							window=window, augment=augment, pos_cap=pos_cap)
+		return None
+
+	# cache the trained weights keyed on everything that determines them (but not
+	# the test set or the metrics), so re-plotting after a metric change reloads the
+	# model and only re-evaluates -- no retraining. Device is excluded so the same
+	# weights are reused across devices; the RoPE buffers are non-persistent and
+	# recomputed by the factory, so max_seq_len need not be in the key.
+	model_config = dict(
+		kind='length_model', V=V, n=n, S=S, N=N, L=int(L), num_train=num_train,
+		ordering=ordering, dag_seed=dag_seed, seed=seed, epochs=epochs,
+		window=window, augment=bool(augment),
+		model=asdict(mcfg),
+		train={k: v for k, v in asdict(tcfg).items() if k != 'device'},
+	)
+	model, _, _ = _load_or_train(factory, train_fn, model_config, device, force)
 
 	seen_states = training_visits(train_chars, train_len, dag)
 	metrics = evaluate(model, test_chars, test_len, dag, seen_states=seen_states,
@@ -470,7 +489,8 @@ def length_unit(profile, ordering, graph, seed, device, force, windowed=False,
 	spec = dict(kind='length', ordering=ordering, V=V, n=n, S=S, N=N, seed=seed,
 				dag_seed=dag_seed, L_grid=profile['L_grid'], num_train=num_train,
 				epochs=epochs, num_test=profile['num_test'], hint_max=HINT_MAX,
-				model=profile['model'], train=profile['train'])
+				model=profile['model'], train=profile['train'],
+				metrics_version=2)     # v2: reports max_covered (longest covered path) instead of L95
 	if windowed:                        # keep the baseline spec (and its cache key)
 		spec['window'] = window         # byte-identical to earlier runs
 	if augmented:
@@ -484,17 +504,17 @@ def length_unit(profile, ordering, graph, seed, device, force, windowed=False,
 		dag0 = build_dag(V, n, S, N, ordering=ordering, seed=dag_seed)
 		gen0 = ReasoningGenerator(dag0)
 		L_max = gen0.max_edges
-		L95 = percentile_length(gen0, 95)          # 95th-pctile path length in edges
 		num_states, num_edges = int(dag0.num_nodes), int(dag0.num_edges)
 		L_values = sorted({L for L in profile['L_grid'] if L < L_max} | {L_max})
 
 		Ls, illegal_bh, cov_bh = [], [], []        # per-L hint curves (len HINT_MAX+1)
+		maxcov = []                                # per-L longest covered path (edges)
 		for L in L_values:
 			try:
 				metrics, _ = _train_short_test_full(
 					V, n, S, N, L, num_train, profile['num_test'], ordering,
 					dag_seed, seed, mcfg, tcfg, epochs, window=window, augment=augmented,
-					num_hints=HINT_MAX)
+					num_hints=HINT_MAX, force=force)
 			except ValueError:
 				# no source-to-sink path with <= L edges: nothing to train on at
 				# this L, so skip it and move on to the next (larger) L
@@ -502,6 +522,7 @@ def length_unit(profile, ordering, graph, seed, device, force, windowed=False,
 			Ls.append(L)
 			illegal_bh.append(metrics['illegal_mass_by_hints'])
 			cov_bh.append(metrics['path_coverage_by_hints'])
+			maxcov.append(metrics['max_covered_edges'])
 			# stop when criteria are met with 0 "hints".
 			if metrics['path_coverage_by_hints'][0] > PATH_COV_CRIT:
 				break
@@ -510,9 +531,15 @@ def length_unit(profile, ordering, graph, seed, device, force, windowed=False,
 		cv = np.array(cov_bh, float).reshape(len(Ls), HINT_MAX + 1)
 		minL_il = [_crossing(Ls, il[:, k], ILLEGAL_CRIT, want_below=True) for k in range(HINT_MAX + 1)]
 		minL_cov = [_crossing(Ls, cv[:, k], PATH_COV_CRIT, want_below=False) for k in range(HINT_MAX + 1)]
+		# longest path the model covers, taken from the same model that reaches the
+		# coverage criterion: the smallest-L model with path_coverage > PATH_COV_CRIT
+		# (the sweep stops right after this L). None if coverage is never reached.
+		crossed = np.where(cv[:, 0] > PATH_COV_CRIT)[0]
+		max_covered = int(maxcov[crossed[0]]) if len(crossed) else None
 		return dict(
 			V=V, n=n, S=S, N=N, seed=seed, ordering=ordering, num_states=num_states,
-			num_edges=num_edges, L_max=int(L_max), L95=L95, window=window, augment=augmented,
+			num_edges=num_edges, L_max=int(L_max), max_covered=max_covered,
+			window=window, augment=augmented,
 			Ls=Ls, illegal=il[:, 0].tolist(), path_coverage=cv[:, 0].tolist(),
 			minL_illegal=minL_il[0], minL_coverage=minL_cov[0],
 			minL_illegal_by_hints=minL_il, minL_coverage_by_hints=minL_cov,
@@ -619,16 +646,6 @@ def _agg_over_seeds(group, key, drop_censored=False):
 	return float(vals.mean()), sem, len(vals)
 
 
-def percentile_length(gen, pct=95, num=20000, seed=0):
-	"""
-	Mass-weighted `pct`-th percentile of the path length in edges: sample paths
-	uniformly over source-to-sink paths and take the ordinary percentile of their
-	edge counts. Deterministic given the graph (fixed rng seed).
-	"""
-	_, lengths = gen.sample(num, np.random.default_rng(seed))
-	return float(np.percentile(lengths - gen.n, pct))
-
-
 def plot_samples_vs_edges(results, name, fit_plain_only=False):
 	"""
 	x = edges (distinct transitions the learner must acquire), y = samples to
@@ -670,7 +687,7 @@ def plot_samples_vs_edges(results, name, fit_plain_only=False):
 			traj = [pts[(g, bw)][:2] for bw in bw_order if (g, bw) in pts]
 			if len(traj) >= 2:
 				ax.plot([t[0] for t in traj], [t[1] for t in traj],
-						ls='-', lw=0.8, color=col, alpha=0.3, zorder=1)
+						ls='--', lw=0.8, color=col, alpha=0.4, zorder=1)
 		# one point (seed mean +/- SEM) per (graph, bucket); all points are plotted,
 		# but the fit uses all points, or only the plain ones if fit_plain_only
 		fx, fy = [], []
@@ -695,22 +712,22 @@ def plot_samples_vs_edges(results, name, fit_plain_only=False):
 	xlim, ylim = ax.get_xlim(), ax.get_ylim()
 	gx_full = np.array(xlim)
 	for (b, c), col in fit_lines:
-		ax.plot(gx_full, c * gx_full ** b, ls=':', lw=1.1, color=col, zorder=0)
+		ax.plot(gx_full, c * gx_full ** b, ls='-', lw=1.6, color=col, zorder=0)
 	ax.set_xlim(xlim)
 	ax.set_ylim(ylim)
 	ax.set_xlabel('Edges', fontsize=LABEL_FS)
 	ax.set_ylabel('Samples', fontsize=LABEL_FS)
 	_style_axis(ax)
 	crit = _legend(ax, [
-		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label='illegal <0.05'),
-		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label='coverage >0.95'),
+		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$P($invalid token$) < 0.05$'),
+		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label=r'path coverage $> 0.95$'),
 	], loc='upper left')
 	ax.add_artist(crit)
 	_legend(ax, [
 		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, label='plain'),
-		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, mfc='none', label='permuted'),
-		Line2D([], [], color='0.35', ls=':', lw=1.1, label='fit'),
-	], loc='lower right')
+		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, mfc='none', label='remapped'),
+		Line2D([], [], color='0.35', ls='-', lw=1.6, label='fit'),
+	], loc='upper left', bbox=(0.0, 0.80))
 	# fit coefficients (all points) are recorded in the provenance, not here
 	return _save(fig, name), fits
 
@@ -791,12 +808,12 @@ def plot_sample_efficiency_vs_edges(results, name, mincover):
 			traj = [pts[(g, bw)][:2] for bw in bw_order if (g, bw) in pts]
 			if len(traj) >= 2:
 				ax.plot([t[0] for t in traj], [t[1] for t in traj],
-						ls='-', lw=0.8, color=col, alpha=0.3, zorder=1)
+						ls='--', lw=0.8, color=col, alpha=0.4, zorder=1)
 		# thick line joining the plain points across graphs (per criterion)
 		plain = sorted(pts[(g, None)][:2] for g in graphs if (g, None) in pts)
 		if len(plain) >= 2:
 			ax.plot([p[0] for p in plain], [p[1] for p in plain],
-					ls='-', lw=2.0, color=col, alpha=0.85, zorder=2)
+					ls='-', lw=1.6, color=col, alpha=0.85, zorder=2)
 		for (g, bw), (x, eff, err) in pts.items():
 			any_pts = True
 			filled = bw is None
@@ -811,13 +828,13 @@ def plot_sample_efficiency_vs_edges(results, name, mincover):
 	_style_axis(ax)
 	# both legends stacked at the top-left (criteria on top, plain/permuted below)
 	crit = _legend(ax, [
-		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label='illegal <0.05'),
-		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label='coverage >0.95'),
+		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$P($invalid token$) < 0.05$'),
+		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label=r'path coverage $>0.95$'),
 	], loc='upper left')
 	ax.add_artist(crit)
 	_legend(ax, [
 		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, label='plain'),
-		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, mfc='none', label='permuted'),
+		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, mfc='none', label='remapped'),
 	], loc='upper left', bbox=(0.0, 0.80))
 	return _save(fig, name)
 
@@ -826,10 +843,12 @@ def plot_length_vs_Lmax(results, name):
 	"""
 	x = L_max (the DAG's longest path), y = smallest training length L reaching a
 	criterion, averaged over the seeds (runs) with +/- SEM error bars. Criteria:
-	illegal (blue) and coverage (green), each with a dotted linear fit L = m * L_max
-	+ c. Grey 'x' markers are the 95th-percentile path length L95 of each graph (the
-	effective max length: 95% of paths are shorter), with its own dotted fit --
-	comparing the training length needed against the length the model must reconstruct.
+	illegal (blue) and coverage (green), each with a solid linear fit L = m * L_max
+	+ c. Grey diamonds are the longest path the model covers (assigns probability
+	>= PATH_RATIO * P_true), measured on the same model that reaches the coverage
+	criterion (the smallest-L model with path_coverage > 0.95), with its own solid
+	fit -- comparing the training length needed against how far that model's
+	coverage actually reaches.
 	"""
 	fig, ax = plt.subplots(figsize=(3, 2.5))
 	graphs = []
@@ -856,41 +875,43 @@ def plot_length_vs_Lmax(results, name):
 		if fits[key]:
 			fit_lines.append((fits[key], col))
 
-	# 95th-percentile path length per graph, as 'x' markers (varies over seeds too now
-	# that each seed draws its own DAG, so it carries a SEM like the other points)
-	L95_COL = '0.4'
+	# longest path the model covers (P_model >= PATH_RATIO * P_true), measured on the
+	# model at the coverage crossing, per graph, as grey diamonds -- one value per
+	# seed (its own DAG), so a SEM like the other points. Seeds whose coverage never
+	# reaches the criterion have no such model (max_covered is None) and are skipped.
+	COV_COL = '0.4'
 	gx, gy, gyerr = [], [], []
 	for g in graphs:
-		group = [r for r in results if (r['V'], r['n']) == g and 'L95' in r]
+		group = [r for r in results if (r['V'], r['n']) == g and r.get('max_covered') is not None]
 		if not group:
 			continue
-		l95 = np.array([r['L95'] for r in group], float)
+		mc = np.array([r['max_covered'] for r in group], float)
 		gx.append(float(np.mean([r['L_max'] for r in group])))
-		gy.append(float(l95.mean()))
-		gyerr.append(float(l95.std(ddof=1) / np.sqrt(len(l95))) if len(l95) > 1 else 0.0)
+		gy.append(float(mc.mean()))
+		gyerr.append(float(mc.std(ddof=1) / np.sqrt(len(mc))) if len(mc) > 1 else 0.0)
 	if gx:
-		ax.errorbar(gx, gy, yerr=gyerr, fmt='x', ms=4, mew=1.1, color=L95_COL,
+		ax.errorbar(gx, gy, yerr=gyerr, fmt='D', ms=3.5, mew=1.0, color=COV_COL,
 					elinewidth=0.7, capsize=0, zorder=3)
-		fits['L95'] = _linear_fit(gx, gy)
-		if fits['L95']:
-			fit_lines.append((fits['L95'], L95_COL))
+		fits['max_covered'] = _linear_fit(gx, gy)
+		if fits['max_covered']:
+			fit_lines.append((fits['max_covered'], COV_COL))
 
 	# draw each fit across the full x-range, holding the data-driven limits so the
 	# lines span the whole plot without expanding the axes
 	xlim = ax.get_xlim()
 	gx_full = np.array(xlim)
 	for (m, c), col in fit_lines:
-		ax.plot(gx_full, m * gx_full + c, ls=':', lw=1.1, color=col, zorder=1)
+		ax.plot(gx_full, m * gx_full + c, ls='-', lw=1.6, color=col, zorder=1)
 	ax.set_xlim(xlim)
 
 	ax.set_xlabel(r'$L_{\max}$', fontsize=LABEL_FS)
-	ax.set_ylabel('Training Length', fontsize=LABEL_FS)
+	ax.set_ylabel('Length', fontsize=LABEL_FS)
 	_style_axis(ax)
 	_legend(ax, [
-		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label='illegal <0.05'),
-		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label='coverage >0.95'),
-		Line2D([], [], color=L95_COL, marker='x', ls='', ms=4, label=r'$L_{95}$'),
-		Line2D([], [], color='0.35', ls=':', lw=1.1, label='fit'),
+		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$L_{\text{train}}$: $P($illegal token$) < 0.05$'),
+		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label=r'$L_{\text{train}}$: path coverage $> 0.95$'),
+		Line2D([], [], color=COV_COL, marker='D', ls='', ms=3.5, label='longest learned path'),
+		Line2D([], [], color='0.35', ls='-', lw=1.6, label='fit'),
 	], loc='upper left')
 	return _save(fig, name), fits
 
@@ -954,7 +975,7 @@ def write_provenance(name, kind, profile, ordering, results, fits=None):
 		# linear fits L = m * L_max + c over the per-graph mean points
 		labels = {'minL_illegal': 'illegal_mass < %s' % ILLEGAL_CRIT,
 				  'minL_coverage': 'path_coverage > %s' % PATH_COV_CRIT}
-		labels['L95'] = '95th-percentile path length (L95) vs L_max'
+		labels['max_covered'] = 'longest covered path (P_model >= %s * P_true) vs L_max' % DEFAULT_PATH_RATIO
 		fit_summary = {}
 		for key, label in labels.items():
 			f = (fits or {}).get(key)
@@ -966,14 +987,15 @@ def write_provenance(name, kind, profile, ordering, results, fits=None):
 			description='experiment 2: train on <= L-edge paths '
 						'(ReasoningGenerator.sample_length_limited), test on the full '
 						'distribution; smallest L reaching a criterion vs L_max, '
-						'with the 95th-percentile path length (L95) for reference',
+						'with the longest covered path (max_covered) for reference',
 			length_epochs=profile['length_epochs'],
 			length_num_train=profile['length_num_train'],
 			L_grid=profile['L_grid'],
 			note='L sweep runs up to each DAG\'s L_max; stops early once path_coverage > threshold',
 			fits=fit_summary,
 			units=[dict(V=r['V'], n=r['n'], seed=r['seed'], num_states=r['num_states'],
-						num_edges=r['num_edges'], L_max=r.get('L_max'), L95=r.get('L95'),
+						num_edges=r['num_edges'], L_max=r.get('L_max'),
+						max_covered=r.get('max_covered'),
 						L_evaluated=r['Ls'], minL_illegal=r['minL_illegal'],
 						minL_coverage=r['minL_coverage'])
 				   for r in results],

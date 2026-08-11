@@ -643,6 +643,9 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 			`path_ratio` times their true probability -- i.e. the proportion of
 			(true-distribution) paths the model still assigns non-trivial
 			probability to.
+		- 'max_covered_edges' : int
+			The longest path length (in edges) among the covered test paths
+			(those meeting the `path_ratio` bar); 0 if none are covered.
 	"""
 	V, n = dag.V, dag.n
 	device = resolve_device(device)
@@ -733,6 +736,10 @@ def evaluate(model, orig_chars, lengths, dag, perms=None, bin_width=None,
 	if true_branch_p is not None:
 		covered = (logp_model - logp_true) >= math.log(path_ratio)
 		res['path_coverage'] = float(covered.mean()) if num else float('nan')
+		# longest path (in edges) the model covers, i.e. assigns probability
+		# >= path_ratio * P_true: the max path length among the covered test paths
+		cov_edges = (lengths - n)[covered]
+		res['max_covered_edges'] = int(cov_edges.max()) if cov_edges.size else 0
 	# When computing metrics with "hints": Give each path k free ground-truth
 	# positions placed at its worst token predictions and recompute the metric on what remains
 	# For illegal_mass, drop the k token predictions with the most illegal mass, and for

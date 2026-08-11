@@ -999,7 +999,7 @@ CURVE_MARKERS = ['o', 's', '^', 'D']
 
 LABEL_FS = 14
 TICK_FS = 12
-LEGEND_FS = 8
+LEGEND_FS = 7
 
 
 def _style_axis(ax):

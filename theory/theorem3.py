@@ -141,8 +141,8 @@ def make_plot(results, outdir, min_frac=0.25, xmax=20):
 				markevery=3, label=f'$V={k}$')
 	ax.set_xlim(0, xmax)
 	ax.set_ylim(bottom=0)
-	ax.set_xlabel('prefix-tree depth', fontsize=LABEL_FS)
-	ax.set_ylabel('out-degree', fontsize=LABEL_FS)
+	ax.set_xlabel('Prefix Tree Depth', fontsize=LABEL_FS)
+	ax.set_ylabel('Out Degree', fontsize=LABEL_FS)
 	_style_axis(ax)
 
 	handles = [Line2D([], [], color=CURVE_COLORS[i], marker=CURVE_MARKERS[i],

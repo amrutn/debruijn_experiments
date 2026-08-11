@@ -1,18 +1,15 @@
 # Combined conda environment for the whole project:
 #   - theory/                (theorem1_theorem2.py, theorem3.py, debruijn_dag_figure.py)
 #   - synthetic_experiment/  (generate_data.py, model.py, train_eval.py, run_experiments.py)
-#   - benchmarks/            (entropy_vs_time.py)
+#   - benchmarks/            (entropy_exp.py)
 #
 # theory needs numpy / scipy / matplotlib / networkx / numba; the synthetic
 # experiment additionally needs torch and einx. torch and einx are installed
 # via pip so the platform-appropriate build is selected automatically -- CUDA
 # on the Linux cluster (the 2x4090 run), MPS on Apple Silicon.
 #
-# The benchmarks entropy experiment (entropy_vs_time.py) serves local Qwen models
-# with vLLM and needs datasets / transformers; math-verify gives stricter math
-# grading. vLLM ships CUDA-only wheels: it installs on the Linux GPU box but NOT
-# on Apple Silicon -- comment out the vllm line below to build the env on macOS
-# (the --plot-only path, which just redraws figures from cache, needs no vLLM).
+# The benchmarks entropy experiment (entropy_exp.py) teacher-forces Qwen with
+# Hugging Face transformers and needs datasets / transformers.
 #
 # Create with:  conda env create -f environment.yml
 # Update with:  conda env update -f environment.yml --prune
@@ -32,10 +29,16 @@ dependencies:
   - tqdm>=4.60           # progress bars for run_experiments.py
   - pip>=23
   - pip:
-      - torch>=2.2         # CUDA build on Linux, MPS build on macOS
+      # torch: MPS build on macOS. On a Linux CUDA box, install a wheel that
+      # matches the *driver*, not just any latest wheel -- PyPI's default torch
+      # (>=2.13) is a CUDA-13 build and needs a newer driver. For a CUDA 12.x
+      # driver (e.g. 12.6) install from the matching cu12 index, e.g.:
+      #   pip install "torch==2.10.0" --index-url https://download.pytorch.org/whl/cu126
+      # Also install other packages with `--no-deps` (or pin torch) so pip does
+      # not silently upgrade torch to an incompatible CUDA build.
+      - torch>=2.2
       - einx>=0.4          # not packaged on conda-forge, so installed via pip
-      # benchmarks/entropy_vs_time.py:
-      - vllm>=0.8.5        # local model serving + top-k logprobs; CUDA-only (skip on macOS)
-      - transformers>=4.51 # >=4.51 for the Qwen3 chat templates / architectures
-      - datasets>=2.19     # loads the reasoning benchmarks from the Hub
-      - math-verify>=0.5   # optional: stricter semantics-aware math answer grading
+      # benchmarks/entropy_exp.py:
+      - transformers>=4.51 # >=4.51 for the Qwen3 architectures
+      - datasets>=2.19     # loads the reasoning benchmarks / WikiText from the Hub
+      - accelerate>=0.26   # required for device_map="auto" multi-GPU model sharding
