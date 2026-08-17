@@ -299,6 +299,27 @@ def max_tokens(grid, interval):
     return (2 * grid.label_len + 1) + n_labels * grid.label_len + L + 1
 
 
+def mean_tokens(grid, interval, min_dist=1):
+    """
+    Mean trace length (total tokens) over the prompt distribution -- all ordered
+    cell pairs with L1 distance >= `min_dist` -- at a given emission `interval`.
+    A path of length ``L`` emits ``floor((L-1)/interval)`` intermediate cells (0
+    for standard), so its trace is ``prompt + start-label + L moves + intermediate
+    labels + goal-label + EOS``. This is the expected sequence length; used as the
+    "length" variable in the reliability term of the fit (contrast `max_tokens`,
+    the worst-case length).
+    """
+    m = grid.m
+    rc = np.array([divmod(c, m) for c in range(grid.M)])
+    dr = np.abs(rc[:, 0][:, None] - rc[:, 0][None, :])
+    dc = np.abs(rc[:, 1][:, None] - rc[:, 1][None, :])
+    L = (dr + dc).ravel().astype(float)
+    L = L[L >= min_dist]
+    n_inter = np.zeros_like(L) if interval is None else np.floor((L - 1) / interval)
+    answer = grid.label_len * (2 + n_inter) + L + 1        # start+goal labels, moves, intermediates, EOS
+    return float((2 * grid.label_len + 1) + answer.mean())
+
+
 # ----------------------------------------------------------------------------
 # sampling a padded token batch
 # ----------------------------------------------------------------------------

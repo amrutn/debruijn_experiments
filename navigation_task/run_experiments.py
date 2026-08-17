@@ -50,11 +50,14 @@ from tqdm.auto import tqdm
 from scipy.optimize import least_squares
 
 from train_eval import run_unit, ModelConfig, TrainConfig
-from generate_data import NavGrid, max_tokens
+from generate_data import NavGrid, max_tokens, mean_tokens
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIG_DIR = os.path.join(HERE, 'figures')
+
+# grids shown in the figures (the sweep may train more; these read cleanest)
+PLOT_GRIDS = (6, 7, 8, 9)
 
 
 # ----------------------------------------------------------------------------
@@ -248,33 +251,34 @@ def _agg(results, m, interval):
 
 def fit_shared(results, restarts=120, seed=0):
     """
-    Mechanistic fit ``accuracy = A * edges^(-p) + B * rho^Tmax + c(grid)``:
+    Mechanistic fit ``accuracy = A * edges^(-p) + B * rho^length + c(grid)``:
     a *learnability* channel plus a *decode-reliability* channel, summed, with a
     per-grid baseline. ``A, p, B, rho`` are shared across grids; ``c`` is a per-grid
-    additive intercept.
+    additive intercept. ``length`` is the *mean* trace length over the prompt
+    distribution (`generate_data.mean_tokens`).
 
     * ``A * edges^(-p)`` -- learnability: at a fixed training budget the fraction of
       the ``O(edges)`` transitions the model has acquired falls off with the DAG
       size (fitted ``p ~ 1/2``). Large at the De Bruijn end (few edges).
-    * ``B * rho^Tmax`` -- decode reliability: each of the ``Tmax`` autoregressive
+    * ``B * rho^length`` -- decode reliability: each of the ``length`` autoregressive
       tokens is produced correctly with probability ``rho``, so a whole trace
-      survives with probability ``rho^Tmax`` (fitted ``rho ~ 0.9``). Large at the
+      survives with probability ``rho^length`` (fitted ``rho ~ 0.9``). Large at the
       standard end (shortest trace).
 
     The two channels are high at opposite ends of the interval sweep, so their sum
     dips in the middle and recovers -- capturing the U-shape. The reliability term
     must enter *additively*: as a multiplicative factor the model is log-linear in
-    (log edges, Tmax) and hence monotone along the connector (no U). The per-grid
+    (log edges, length) and hence monotone along the connector (no U). The per-grid
     intercept absorbs the grid-size baseline. ``edges`` is centred in log and
-    ``Tmax`` in raw units for conditioning; ``p`` and ``rho`` are scale-invariant.
+    ``length`` in raw units for conditioning; ``p`` and ``rho`` are scale-invariant.
 
     Returns
     -------
     dict
         {'A', 'p', 'B', 'rho', 'c': {m: intercept}, 'r2', 'predict'} where
-        ``predict(m, Tmax, edges) -> accuracy``.
+        ``predict(m, length, edges) -> accuracy``.
     """
-    T = np.array([max_tokens(NavGrid(r['m']), r['interval']) for r in results], float)
+    T = np.array([mean_tokens(NavGrid(r['m']), r['interval']) for r in results], float)
     E = np.array([r['edges'] for r in results], float)
     y = np.array([r['accuracy'] for r in results], float)
     ms = [r['m'] for r in results]
@@ -316,19 +320,20 @@ _INTERVAL_CMAP = mcolors.LinearSegmentedColormap.from_list(
 
 def plot_accuracy_vs_edges(results, name='accuracy_vs_edges'):
     """
-    Held-out accuracy vs exact minimal-DAG edges. Each grid is one task: its
-    emission-interval conditions -- De Bruijn (state every step) through every-m
-    steps, then standard (state only at the ends) -- lie along a translucent
-    dashed connector, ordered by edge count. Marker fill is shaded by interval
-    (De Bruijn darkest, larger intervals lighter, standard hollow). Points are
-    seed means, error bars +/- SEM.
+    Held-out accuracy vs exact minimal-DAG edges (log2 x). Each grid is one task:
+    its emission-interval conditions -- De Bruijn (state every step) through
+    every-m steps, then standard (state only at the ends) -- lie along a
+    translucent dashed connector, ordered by edge count. Marker fill is shaded by
+    interval (De Bruijn darkest, standard hollow). The shared mechanistic fit
+    (`fit_shared`, learnability in edges + reliability in mean trace length) is
+    overlaid. Points are seed means, error bars +/- SEM.
     """
-    fig, ax = plt.subplots(figsize=(3, 2.5))
+    fig, ax = plt.subplots(figsize=(4.4, 2.6))
     grids = sorted({r['m'] for r in results})
     edge_col = CURVE_COLORS[0]
     ivals = sorted({r['interval'] for r in results if r['interval'] is not None})
     kmax = max(ivals) if ivals else 1
-    fit = fit_shared(results)                        # acc = a*Tmax^alpha*edges^beta + b(grid)
+    fit = fit_shared(results)
 
     def fill(interval):
         if interval is None:
@@ -346,9 +351,8 @@ def plot_accuracy_vs_edges(results, name='accuracy_vs_edges'):
         if len(pts) >= 2:                            # connector through all points
             ax.plot([p[1] for p in pts], [p[2] for p in pts],
                     ls='--', lw=0.8, color=edge_col, alpha=0.4, zorder=1)
-        # fitted curve for this grid (shared alpha,beta; per-grid intercept)
-        fx = [p[1] for p in pts]
-        fy = [fit['predict'](m, max_tokens(NavGrid(m), p[0]), p[1]) for p in pts]
+        fx = [p[1] for p in pts]                      # fitted curve (fit uses edges & mean length)
+        fy = [fit['predict'](m, mean_tokens(NavGrid(m), p[0]), p[1]) for p in pts]
         if len(fx) >= 2:
             ax.plot(fx, fy, ls='-', lw=1.2, color=edge_col, alpha=0.7, zorder=2)
         for (iv, x, mean, sem, _n) in pts:
@@ -356,21 +360,16 @@ def plot_accuracy_vs_edges(results, name='accuracy_vs_edges'):
                         markerfacecolor=fill(iv), markeredgecolor=edge_col,
                         ecolor=edge_col, elinewidth=0.7, capsize=0, zorder=3)
 
-    ax.set_xscale('log', base=2)
+    ax.set_xscale('log')                             # log10 x
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel('Edges in minimal DAG', fontsize=LABEL_FS)
     ax.set_ylabel('Test accuracy', fontsize=LABEL_FS)
-    _style_axis(ax)
-    # log2 x-ticks (override the base-10 ticks _style_axis places)
-    ax.xaxis.set_major_locator(mticker.LogLocator(base=2))
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(
-        lambda v, _: rf'$2^{{{int(round(np.log2(v)))}}}$' if v > 0 else ''))
-    ax.xaxis.set_minor_locator(mticker.NullLocator())
-    ax.xaxis.set_minor_formatter(mticker.NullFormatter())
-    # fitted law, upper right
+    _style_axis(ax)                                  # places base-10 log ticks
+    # fitted law with raw fitted numbers (c_m is per-grid, kept symbolic)
     ax.text(0.97, 0.97,
-            rf'$A\,E^{{-{fit["p"]:.2f}}}+B\,\rho^{{T}}+c_m$'
-            + '\n' + rf'$\rho={fit["rho"]:.2f},\ R^2={fit["r2"]:.2f}$',
+            rf'${fit["A"]:.2f}\,(\mathrm{{edges}})^{{-{fit["p"]:.2f}}}'
+            rf'+{fit["B"]:.2f}{{\cdot}}{fit["rho"]:.2f}^{{\mathrm{{len}}}}+c_m$'
+            + '\n' + rf'$R^2={fit["r2"]:.2f}$',
             transform=ax.transAxes, ha='right', va='top', fontsize=LEGEND_FS,
             color=edge_col)
 
@@ -418,23 +417,18 @@ def plot_facets(results, name='accuracy_vs_edges_facets', ncols=4):
                 pts.append((iv,) + a)
         pts.sort(key=lambda p: p[1])
         fx = [p[1] for p in pts]
-        fy = [fit['predict'](m, max_tokens(NavGrid(m), p[0]), p[1]) for p in pts]
+        fy = [fit['predict'](m, mean_tokens(NavGrid(m), p[0]), p[1]) for p in pts]
         if len(fx) >= 2:
             ax.plot(fx, fy, ls='-', lw=1.3, color=edge_col, alpha=0.8, zorder=2)
         for (iv, x, mean, sem, _n) in pts:
             ax.errorbar(x, mean, yerr=sem, fmt='o', ms=3.6, mew=0.8,
                         markerfacecolor=fill(iv), markeredgecolor=edge_col,
                         ecolor=edge_col, elinewidth=0.6, capsize=0, zorder=3)
-        ax.set_xscale('log', base=2)
+        ax.set_xscale('log')
         ax.set_ylim(-0.02, 1.02)
         ax.set_title(rf'$m={m}$', fontsize=TICK_FS)
         ax.tick_params(labelsize=TICK_FS - 3)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        ax.xaxis.set_major_locator(mticker.LogLocator(base=2, numticks=5))
-        ax.xaxis.set_major_formatter(mticker.FuncFormatter(
-            lambda v, _: rf'$2^{{{int(round(np.log2(v)))}}}$' if v > 0 else ''))
-        ax.xaxis.set_minor_locator(mticker.NullLocator())
+        _style_axis(ax)
     for ax in axes[len(grids):]:
         ax.axis('off')
 
@@ -486,10 +480,11 @@ def main():
     print(f'profile={profile_name}  devices={devices}  grids={profile["grids"]}')
 
     results = run_all(profile, devices, args.force)
-    path, fit = plot_accuracy_vs_edges(results)
-    fpath, _ = plot_facets(results)
+    plot_res = [r for r in results if r['m'] in PLOT_GRIDS] or results
+    path, fit = plot_accuracy_vs_edges(plot_res)
+    fpath, _ = plot_facets(plot_res)
     print('wrote', path + '.pdf/.png', 'and', fpath + '.pdf/.png')
-    print(f'fit: acc = {fit["A"]:.3f}*edges^-{fit["p"]:.3f} + {fit["B"]:.3f}*{fit["rho"]:.3f}^Tmax'
+    print(f'fit: acc = {fit["A"]:.3f}*edges^-{fit["p"]:.3f} + {fit["B"]:.3f}*{fit["rho"]:.3f}^len'
           f' + c(grid)   R^2={fit["r2"]:.3f}')
     # brief text summary: De Bruijn (k=1) and standard endpoints per grid
     for m in sorted({r['m'] for r in results}):
