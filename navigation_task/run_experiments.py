@@ -47,7 +47,10 @@ import matplotlib.colors as mcolors
 from matplotlib.lines import Line2D
 from tqdm.auto import tqdm
 
+from scipy.optimize import least_squares
+
 from train_eval import run_unit, ModelConfig, TrainConfig
+from generate_data import NavGrid, max_tokens
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -149,7 +152,7 @@ PROFILES = {
     ),
     'full': dict(
         grids=[5, 6, 7, 8, 9, 10, 11, 12],
-        num_train=8000,            # fixed budget: standard's O(M^2) DAG outgrows
+        num_train=16000,            # fixed budget: standard's O(M^2) DAG outgrows
                                     # it as the grid enlarges, De Bruijn's O(M) does not
         epochs=6,
         test_frac=0.2,
@@ -243,6 +246,68 @@ def _agg(results, m, interval):
     return edges, float(accs.mean()), sem, n
 
 
+def fit_shared(results, restarts=120, seed=0):
+    """
+    Mechanistic fit ``accuracy = A * edges^(-p) + B * rho^Tmax + c(grid)``:
+    a *learnability* channel plus a *decode-reliability* channel, summed, with a
+    per-grid baseline. ``A, p, B, rho`` are shared across grids; ``c`` is a per-grid
+    additive intercept.
+
+    * ``A * edges^(-p)`` -- learnability: at a fixed training budget the fraction of
+      the ``O(edges)`` transitions the model has acquired falls off with the DAG
+      size (fitted ``p ~ 1/2``). Large at the De Bruijn end (few edges).
+    * ``B * rho^Tmax`` -- decode reliability: each of the ``Tmax`` autoregressive
+      tokens is produced correctly with probability ``rho``, so a whole trace
+      survives with probability ``rho^Tmax`` (fitted ``rho ~ 0.9``). Large at the
+      standard end (shortest trace).
+
+    The two channels are high at opposite ends of the interval sweep, so their sum
+    dips in the middle and recovers -- capturing the U-shape. The reliability term
+    must enter *additively*: as a multiplicative factor the model is log-linear in
+    (log edges, Tmax) and hence monotone along the connector (no U). The per-grid
+    intercept absorbs the grid-size baseline. ``edges`` is centred in log and
+    ``Tmax`` in raw units for conditioning; ``p`` and ``rho`` are scale-invariant.
+
+    Returns
+    -------
+    dict
+        {'A', 'p', 'B', 'rho', 'c': {m: intercept}, 'r2', 'predict'} where
+        ``predict(m, Tmax, edges) -> accuracy``.
+    """
+    T = np.array([max_tokens(NavGrid(r['m']), r['interval']) for r in results], float)
+    E = np.array([r['edges'] for r in results], float)
+    y = np.array([r['accuracy'] for r in results], float)
+    ms = [r['m'] for r in results]
+    grids = sorted(set(ms))
+    gi = {g: i for i, g in enumerate(grids)}
+    gidx = np.array([gi[m] for m in ms])
+    lEm, Tm = np.log(E).mean(), T.mean()
+    lEn, Tn = np.log(E) - lEm, T - Tm
+
+    def resid(p):
+        A, pw, B, r = p[:4]
+        return A * np.exp(-pw * lEn) + B * np.exp(r * Tn) + p[4:][gidx] - y
+
+    rng = np.random.default_rng(seed)
+    lo = np.array([-50, -2, -50, -1] + [-5] * len(grids), float)
+    hi = np.array([50, 4, 50, 0.2] + [5] * len(grids), float)
+    best = None
+    for _ in range(restarts):
+        s = least_squares(resid, rng.uniform(lo, hi), bounds=(lo, hi), max_nfev=8000)
+        if best is None or s.cost < best.cost:
+            best = s
+    A, pw, B, r = best.x[:4]
+    cvec = best.x[4:]
+    r2 = 1.0 - (best.fun ** 2).sum() / ((y - y.mean()) ** 2).sum()
+
+    def predict(m, Tv, Ev):
+        return A * np.exp(-pw * (np.log(Ev) - lEm)) + B * np.exp(r * (Tv - Tm)) + cvec[gi[m]]
+
+    return dict(A=float(A), p=float(pw), B=float(B), rho=float(np.exp(r)),
+                c={g: float(cvec[gi[g]]) for g in grids}, r2=float(r2),
+                predict=predict)
+
+
 # dark -> light fill for the emission interval: De Bruijn (k=1) darkest, larger k
 # lighter, standard (no re-emission) hollow.
 _INTERVAL_CMAP = mcolors.LinearSegmentedColormap.from_list(
@@ -263,6 +328,7 @@ def plot_accuracy_vs_edges(results, name='accuracy_vs_edges'):
     edge_col = CURVE_COLORS[0]
     ivals = sorted({r['interval'] for r in results if r['interval'] is not None})
     kmax = max(ivals) if ivals else 1
+    fit = fit_shared(results)                        # acc = a*Tmax^alpha*edges^beta + b(grid)
 
     def fill(interval):
         if interval is None:
@@ -280,22 +346,39 @@ def plot_accuracy_vs_edges(results, name='accuracy_vs_edges'):
         if len(pts) >= 2:                            # connector through all points
             ax.plot([p[1] for p in pts], [p[2] for p in pts],
                     ls='--', lw=0.8, color=edge_col, alpha=0.4, zorder=1)
+        # fitted curve for this grid (shared alpha,beta; per-grid intercept)
+        fx = [p[1] for p in pts]
+        fy = [fit['predict'](m, max_tokens(NavGrid(m), p[0]), p[1]) for p in pts]
+        if len(fx) >= 2:
+            ax.plot(fx, fy, ls='-', lw=1.2, color=edge_col, alpha=0.7, zorder=2)
         for (iv, x, mean, sem, _n) in pts:
             ax.errorbar(x, mean, yerr=sem, fmt='o', ms=4.2, mew=1.0,
                         markerfacecolor=fill(iv), markeredgecolor=edge_col,
                         ecolor=edge_col, elinewidth=0.7, capsize=0, zorder=3)
 
-    ax.set_xscale('log')
+    ax.set_xscale('log', base=2)
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel('Edges in minimal DAG', fontsize=LABEL_FS)
     ax.set_ylabel('Test accuracy', fontsize=LABEL_FS)
     _style_axis(ax)
+    # log2 x-ticks (override the base-10 ticks _style_axis places)
+    ax.xaxis.set_major_locator(mticker.LogLocator(base=2))
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda v, _: rf'$2^{{{int(round(np.log2(v)))}}}$' if v > 0 else ''))
+    ax.xaxis.set_minor_locator(mticker.NullLocator())
+    ax.xaxis.set_minor_formatter(mticker.NullFormatter())
+    # fitted law, upper right
+    ax.text(0.97, 0.97,
+            rf'$A\,E^{{-{fit["p"]:.2f}}}+B\,\rho^{{T}}+c_m$'
+            + '\n' + rf'$\rho={fit["rho"]:.2f},\ R^2={fit["r2"]:.2f}$',
+            transform=ax.transAxes, ha='right', va='top', fontsize=LEGEND_FS,
+            color=edge_col)
 
     # slim colorbar mapping fill shade -> emission interval k
     sm = plt.cm.ScalarMappable(cmap=_INTERVAL_CMAP,
                                norm=mcolors.Normalize(vmin=1, vmax=kmax))
     cb = fig.colorbar(sm, ax=ax, pad=0.02, fraction=0.05)
-    cb.set_label(r'interval $k$', fontsize=LEGEND_FS + 2)
+    cb.set_label(r'Interval $k$', fontsize=LEGEND_FS + 2)
     cb.ax.tick_params(labelsize=TICK_FS - 3)
 
     _legend(ax, [
@@ -304,7 +387,69 @@ def plot_accuracy_vs_edges(results, name='accuracy_vs_edges'):
         Line2D([], [], color=edge_col, marker='o', ls='', ms=4, mfc='none',
                label='Standard'),
     ], loc='lower left')
-    return _save(fig, name)
+    return _save(fig, name), fit
+
+
+def plot_facets(results, name='accuracy_vs_edges_facets', ncols=4):
+    """
+    Small-multiples version: one panel per grid, so each grid's interval sweep
+    (and its U-shape) fills its own axes without the 8 connectors overlapping in a
+    single frame. Same shading (interval, De Bruijn darkest, standard hollow) and
+    the shared mechanistic fit overlaid per panel. Returns (path, fit).
+    """
+    grids = sorted({r['m'] for r in results})
+    nrows = (len(grids) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(2.05 * ncols, 1.95 * nrows),
+                             sharey=True, constrained_layout=True)
+    axes = np.atleast_1d(axes).ravel()
+    edge_col = CURVE_COLORS[0]
+    ivals = sorted({r['interval'] for r in results if r['interval'] is not None})
+    kmax = max(ivals) if ivals else 1
+    fit = fit_shared(results)
+
+    def fill(iv):
+        return 'none' if iv is None else _INTERVAL_CMAP(0.0 if kmax <= 1 else (iv - 1) / (kmax - 1))
+
+    for ax, m in zip(axes, grids):
+        pts = []
+        for iv in _intervals_for(m):
+            a = _agg(results, m, iv)
+            if a:
+                pts.append((iv,) + a)
+        pts.sort(key=lambda p: p[1])
+        fx = [p[1] for p in pts]
+        fy = [fit['predict'](m, max_tokens(NavGrid(m), p[0]), p[1]) for p in pts]
+        if len(fx) >= 2:
+            ax.plot(fx, fy, ls='-', lw=1.3, color=edge_col, alpha=0.8, zorder=2)
+        for (iv, x, mean, sem, _n) in pts:
+            ax.errorbar(x, mean, yerr=sem, fmt='o', ms=3.6, mew=0.8,
+                        markerfacecolor=fill(iv), markeredgecolor=edge_col,
+                        ecolor=edge_col, elinewidth=0.6, capsize=0, zorder=3)
+        ax.set_xscale('log', base=2)
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_title(rf'$m={m}$', fontsize=TICK_FS)
+        ax.tick_params(labelsize=TICK_FS - 3)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.xaxis.set_major_locator(mticker.LogLocator(base=2, numticks=5))
+        ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+            lambda v, _: rf'$2^{{{int(round(np.log2(v)))}}}$' if v > 0 else ''))
+        ax.xaxis.set_minor_locator(mticker.NullLocator())
+    for ax in axes[len(grids):]:
+        ax.axis('off')
+
+    fig.supxlabel('Edges in minimal DAG', fontsize=LABEL_FS)
+    fig.supylabel('Test accuracy', fontsize=LABEL_FS)
+    sm = plt.cm.ScalarMappable(cmap=_INTERVAL_CMAP, norm=mcolors.Normalize(vmin=1, vmax=kmax))
+    cb = fig.colorbar(sm, ax=axes.tolist(), pad=0.01, fraction=0.03)
+    cb.set_label(r'Interval $k$', fontsize=LEGEND_FS + 2)
+    cb.ax.tick_params(labelsize=TICK_FS - 3)
+    os.makedirs(FIG_DIR, exist_ok=True)
+    path = os.path.join(FIG_DIR, name)
+    fig.savefig(path + '.pdf')
+    fig.savefig(path + '.png', dpi=300)
+    plt.close(fig)
+    return path, fit
 
 
 # ----------------------------------------------------------------------------
@@ -341,8 +486,11 @@ def main():
     print(f'profile={profile_name}  devices={devices}  grids={profile["grids"]}')
 
     results = run_all(profile, devices, args.force)
-    path = plot_accuracy_vs_edges(results)
-    print('wrote', path + '.pdf/.png')
+    path, fit = plot_accuracy_vs_edges(results)
+    fpath, _ = plot_facets(results)
+    print('wrote', path + '.pdf/.png', 'and', fpath + '.pdf/.png')
+    print(f'fit: acc = {fit["A"]:.3f}*edges^-{fit["p"]:.3f} + {fit["B"]:.3f}*{fit["rho"]:.3f}^Tmax'
+          f' + c(grid)   R^2={fit["r2"]:.3f}')
     # brief text summary: De Bruijn (k=1) and standard endpoints per grid
     for m in sorted({r['m'] for r in results}):
         row = []
