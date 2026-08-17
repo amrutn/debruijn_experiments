@@ -49,7 +49,7 @@ from tqdm.auto import tqdm
 
 from scipy.optimize import least_squares
 
-from train_eval import run_unit, ModelConfig, TrainConfig
+from train_eval import run_unit, cached_unit, ModelConfig, TrainConfig
 from generate_data import NavGrid, max_tokens, mean_tokens
 
 
@@ -154,7 +154,7 @@ PROFILES = {
         train=dict(lr=2e-3, weight_decay=1e-2, batch_size=256),
     ),
     'full': dict(
-        grids=[5, 6, 7, 8, 9, 10, 11, 12],
+        grids=[6, 7, 8, 9],
         num_train=16000,            # fixed budget: standard's O(M^2) DAG outgrows
                                     # it as the grid enlarges, De Bruijn's O(M) does not
         epochs=6,
@@ -196,25 +196,50 @@ def _run_device_jobs(jobs, device, profile, force, q=None):
     return out
 
 
+def _cached_or_none(job, device, profile):
+    """Cache hit for a (m, interval, seed) job on `device`, or None. Builds no
+    model and touches no device (the cache key includes the device via tcfg, so
+    the assigned device is passed to match how the unit was written)."""
+    m, iv, seed = job
+    mcfg = ModelConfig(**profile['model'])
+    tcfg = TrainConfig(device=device, seed=seed, **profile['train'])
+    return cached_unit(m=m, interval=iv, num_train=profile.get('num_train'),
+                       samples_per_cell=profile.get('samples_per_cell'),
+                       test_frac=profile['test_frac'], eval_cap=profile['eval_cap'],
+                       epochs=profile['epochs'], seed=seed, mcfg=mcfg, tcfg=tcfg)
+
+
 def run_all(profile, devices, force):
     """
     Run every (grid, interval, seed) unit, partitioned across `devices` (one
-    process per device). A single progress bar accumulates completed points
-    across all devices. Returns the flat list of per-unit result dicts.
+    process per device). The cache is checked up front (unless `force`): units
+    already computed are loaded here and only the missing ones are dispatched, so
+    a fully-cached sweep spawns no worker processes and initialises no GPU. A
+    single progress bar accumulates the remaining points across all devices.
+    Returns the flat list of per-unit result dicts.
     """
     jobs = [(m, iv, seed) for m in profile['grids']
             for iv in _intervals_for(m) for seed in profile['seeds']]
-    total = len(jobs)
-    # partition round-robin so each device gets a balanced share
-    buckets = {d: [] for d in devices}
-    for i, job in enumerate(jobs):
-        buckets[devices[i % len(devices)]].append(job)
+    # round-robin device assignment (kept identical for the cache check and the run)
+    assigned = [(job, devices[i % len(devices)]) for i, job in enumerate(jobs)]
 
-    results = []
+    # up-front cache check: collect hits, queue only the misses
+    results, todo = [], []
+    for job, dev in assigned:
+        r = None if force else _cached_or_none(job, dev, profile)
+        (results.append(r) if r is not None else todo.append((job, dev)))
+    print(f'cache: {len(results)}/{len(jobs)} units cached, {len(todo)} to run')
+    if not todo:
+        return results
+
+    buckets = {d: [] for d in devices}
+    for job, dev in todo:
+        buckets[dev].append(job)
+
     if len(devices) == 1:
-        with tqdm(total=total, desc='points') as bar:
-            for (m, iv, seed) in buckets[devices[0]]:
-                results.extend(_run_device_jobs([(m, iv, seed)], devices[0], profile, force))
+        with tqdm(total=len(todo), desc='points') as bar:
+            for job in buckets[devices[0]]:
+                results.extend(_run_device_jobs([job], devices[0], profile, force))
                 bar.update(1)
         return results
 
@@ -222,10 +247,10 @@ def run_all(profile, devices, force):
     manager = ctx.Manager()
     q = manager.Queue()
     with ProcessPoolExecutor(max_workers=len(devices), mp_context=ctx) as ex, \
-            tqdm(total=total, desc='points') as bar:
+            tqdm(total=len(todo), desc='points') as bar:
         futs = [ex.submit(_run_device_jobs, buckets[d], d, profile, force, q)
                 for d in devices if buckets[d]]
-        for _ in range(total):                       # one token per completed unit
+        for _ in range(len(todo)):                   # one token per completed unit
             q.get()
             bar.update(1)
         for f in futs:
@@ -293,8 +318,8 @@ def fit_shared(results, restarts=120, seed=0):
         return A * np.exp(-pw * lEn) + B * np.exp(r * Tn) + p[4:][gidx] - y
 
     rng = np.random.default_rng(seed)
-    lo = np.array([-50, -2, -50, -1] + [-5] * len(grids), float)
-    hi = np.array([50, 4, 50, 0.2] + [5] * len(grids), float)
+    lo = np.array([-50, -2, -50, -1] + [-50] * len(grids), float)
+    hi = np.array([50, 4, 50, 0.2] + [50] * len(grids), float)
     best = None
     for _ in range(restarts):
         s = least_squares(resid, rng.uniform(lo, hi), bounds=(lo, hi), max_nfev=8000)
@@ -328,7 +353,7 @@ def plot_accuracy_vs_edges(results, name='accuracy_vs_edges'):
     (`fit_shared`, learnability in edges + reliability in mean trace length) is
     overlaid. Points are seed means, error bars +/- SEM.
     """
-    fig, ax = plt.subplots(figsize=(4.4, 2.6))
+    fig, ax = plt.subplots(figsize=(4.5, 2.5))
     grids = sorted({r['m'] for r in results})
     edge_col = CURVE_COLORS[0]
     ivals = sorted({r['interval'] for r in results if r['interval'] is not None})
@@ -354,21 +379,21 @@ def plot_accuracy_vs_edges(results, name='accuracy_vs_edges'):
         fx = [p[1] for p in pts]                      # fitted curve (fit uses edges & mean length)
         fy = [fit['predict'](m, mean_tokens(NavGrid(m), p[0]), p[1]) for p in pts]
         if len(fx) >= 2:
-            ax.plot(fx, fy, ls='-', lw=1.2, color=edge_col, alpha=0.7, zorder=2)
+            ax.plot(fx, fy, ls='-', lw=1.2, color=edge_col, alpha=1.0, zorder=2)
         for (iv, x, mean, sem, _n) in pts:
             ax.errorbar(x, mean, yerr=sem, fmt='o', ms=4.2, mew=1.0,
                         markerfacecolor=fill(iv), markeredgecolor=edge_col,
                         ecolor=edge_col, elinewidth=0.7, capsize=0, zorder=3)
 
     ax.set_xscale('log')                             # log10 x
-    ax.set_ylim(-0.02, 1.02)
+    ax.set_ylim(0.4, 1.02)
     ax.set_xlabel('Edges in minimal DAG', fontsize=LABEL_FS)
     ax.set_ylabel('Test accuracy', fontsize=LABEL_FS)
     _style_axis(ax)                                  # places base-10 log ticks
     # fitted law with raw fitted numbers (c_m is per-grid, kept symbolic)
     ax.text(0.97, 0.97,
             rf'${fit["A"]:.2f}\,(\mathrm{{edges}})^{{-{fit["p"]:.2f}}}'
-            rf'+{fit["B"]:.2f}{{\cdot}}{fit["rho"]:.2f}^{{\mathrm{{len}}}}+c_m$'
+            rf'+{fit["B"]:.2f}{{\cdot}}{fit["rho"]:.2f}^{{\mathrm{{length}}}}+c_m$'
             + '\n' + rf'$R^2={fit["r2"]:.2f}$',
             transform=ax.transAxes, ha='right', va='top', fontsize=LEGEND_FS,
             color=edge_col)
@@ -486,6 +511,7 @@ def main():
     print('wrote', path + '.pdf/.png', 'and', fpath + '.pdf/.png')
     print(f'fit: acc = {fit["A"]:.3f}*edges^-{fit["p"]:.3f} + {fit["B"]:.3f}*{fit["rho"]:.3f}^len'
           f' + c(grid)   R^2={fit["r2"]:.3f}')
+    print('  c_m: ' + '  '.join(f'm={m}:{c:+.3f}' for m, c in sorted(fit['c'].items())))
     # brief text summary: De Bruijn (k=1) and standard endpoints per grid
     for m in sorted({r['m'] for r in results}):
         row = []

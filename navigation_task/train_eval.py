@@ -311,6 +311,46 @@ def _unit_key(spec):
     return hashlib.sha1(blob.encode()).hexdigest()[:16]
 
 
+def _unit_spec_path(m, interval, samples_per_cell, num_train, test_frac, eval_cap,
+                    epochs, seed, prompt_seed, min_dist, mcfg, tcfg):
+    """
+    Resolve the training-set size and build the cache spec + file path for a unit.
+    Shared by `run_unit` and `cached_unit` so the cache key never drifts between
+    the writer and the up-front cache check.
+    """
+    tcfg.seed = seed
+    if samples_per_cell is not None:
+        num_train = int(round(samples_per_cell * (m * m)))
+    if num_train is None:
+        raise ValueError('provide samples_per_cell or num_train')
+    spec = dict(task='nav', m=m, interval=interval, num_train=num_train,
+                test_frac=test_frac, eval_cap=eval_cap, epochs=epochs, seed=seed,
+                prompt_seed=prompt_seed, min_dist=min_dist,
+                model=asdict(mcfg), train=asdict(tcfg))
+    return spec, num_train, os.path.join(UNIT_CACHE_DIR, _unit_key(spec) + '.json')
+
+
+def cached_unit(m, interval, samples_per_cell=None, num_train=None, test_frac=0.2,
+                eval_cap=2000, epochs=1, seed=0, prompt_seed=0, mcfg=None, tcfg=None,
+                min_dist=1):
+    """
+    Return the cached result dict for a unit if it exists, else None -- without
+    building a model or touching a device. Lets a caller check the cache up front
+    and skip the run machinery (and any GPU spawn) for units already computed. The
+    arguments must match the corresponding `run_unit` call so the key agrees.
+    """
+    mcfg = mcfg or ModelConfig()
+    tcfg = tcfg or TrainConfig()
+    _, _, path = _unit_spec_path(m, interval, samples_per_cell, num_train, test_frac,
+                                 eval_cap, epochs, seed, prompt_seed, min_dist, mcfg, tcfg)
+    if os.path.exists(path):
+        with open(path) as f:
+            r = json.load(f)
+        r['cached'] = True
+        return r
+    return None
+
+
 def run_unit(m, interval, samples_per_cell=None, num_train=None, test_frac=0.2,
              eval_cap=2000, epochs=1, seed=0, prompt_seed=0, mcfg=None, tcfg=None,
              min_dist=1, force=False):
@@ -371,24 +411,17 @@ def run_unit(m, interval, samples_per_cell=None, num_train=None, test_frac=0.2,
     tcfg = tcfg or TrainConfig()
     tcfg.seed = seed
 
-    grid = NavGrid(m)
-    if samples_per_cell is not None:
-        num_train = int(round(samples_per_cell * grid.M))
-    if num_train is None:
-        raise ValueError('provide samples_per_cell or num_train')
-
-    spec = dict(task='nav', m=m, interval=interval, num_train=num_train,
-                test_frac=test_frac, eval_cap=eval_cap, epochs=epochs, seed=seed,
-                prompt_seed=prompt_seed, min_dist=min_dist,
-                model=asdict(mcfg), train=asdict(tcfg))
+    spec, num_train, path = _unit_spec_path(m, interval, samples_per_cell, num_train,
+                                            test_frac, eval_cap, epochs, seed,
+                                            prompt_seed, min_dist, mcfg, tcfg)
     os.makedirs(UNIT_CACHE_DIR, exist_ok=True)
-    path = os.path.join(UNIT_CACHE_DIR, _unit_key(spec) + '.json')
     if os.path.exists(path) and not force:
         with open(path) as f:
             r = json.load(f)
         r['cached'] = True
         return r
 
+    grid = NavGrid(m)
     train_prompts, test_prompts = split_prompts(grid, test_frac=test_frac,
                                                 seed=prompt_seed, min_dist=min_dist)
     edges = dag_edges(grid, train_prompts, interval)
