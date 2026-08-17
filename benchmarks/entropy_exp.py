@@ -91,6 +91,10 @@ if ARGS.devices:
     _indices = [str(d)[len('cuda:'):] if str(d).lower().startswith('cuda:') else str(d)
                 for d in ARGS.devices]
     os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(_indices)
+# expandable segments let the caching allocator grow/shrink blocks, cutting the
+# reserved-but-unallocated fragmentation that otherwise wastes GiB during the
+# batched prefill and the growing full-context KV cache.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
@@ -134,6 +138,32 @@ def load_model(attn_implementation=None):
         dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
         device_map="auto" if DEVICE == "cuda" else None,
     )
+    if DEVICE == "cuda":
+        # Spread the weights EVENLY across all visible GPUs. Two placement traps to
+        # avoid: (a) plain device_map="auto" packs the model onto the fewest GPUs
+        # that fit; (b) an explicit per-GPU max_memory cap makes accelerate fill the
+        # low-index GPUs greedily and leave the rest empty. Both concentrate the
+        # weights on GPU 0, so the batched prefill activation (~17 GiB on the hot
+        # GPU at batch 64) lands on an already-loaded GPU and OOMs while GPUs sit
+        # idle. get_balanced_memory computes an EVEN per-GPU weight budget: a 14B
+        # model lands as ~5 GiB on each of 6 GPUs, leaving ~19 GiB free per GPU for
+        # the prefill activations and the growing KV cache.
+        try:
+            from accelerate import init_empty_weights
+            from accelerate.utils import get_balanced_memory
+            from transformers import AutoConfig
+            cfg = AutoConfig.from_pretrained(MODEL_NAME)
+            with init_empty_weights():
+                probe = AutoModelForCausalLM.from_config(cfg, torch_dtype=kwargs['dtype'])
+            probe.tie_weights()
+            bal = get_balanced_memory(
+                probe, dtype=kwargs['dtype'], low_zero=True,   # keep GPU0 lighter
+                no_split_module_classes=getattr(probe, "_no_split_modules", None))
+            del probe
+            gc.collect()
+            kwargs['max_memory'] = {d: b for d, b in bal.items() if isinstance(d, int)}
+        except Exception as e:
+            print(f"  get_balanced_memory unavailable ({e}); using device_map='auto'")
     # the knockout experiment passes a custom 4D attention mask; eager attention
     # applies a user-supplied mask predictably (added to the scores)
     if attn_implementation is not None:
