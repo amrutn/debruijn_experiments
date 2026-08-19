@@ -406,6 +406,134 @@ def samples_unit(profile, ordering, graph, bin_width, seed, device, force):
 	return _cached_unit(spec, compute, force)[0]
 
 
+# ----------------------------------------------------------------------------
+# samples_vs_edges_minimal (--minimal): train on the optimal P_min edge covering
+# ----------------------------------------------------------------------------
+
+def _cover_flow(dag):
+	"""The trace-minimal edge-cover flow for `dag`, via theory's min_cost_cover_flow
+	(lambda large -> minimize the number of source-to-sink traces, i.e. P_min). Returns
+	{(u, v): f >= 1}: an integer flow covering every edge at least once."""
+	theory_dir = os.path.join(os.path.dirname(HERE), 'theory')
+	if theory_dir not in sys.path:
+		sys.path.insert(0, theory_dir)
+	from reasoning_tradeoff import min_cost_cover_flow
+	_, _, edge_flow = min_cost_cover_flow(dag, lam=int(dag.num_edges) + 10)
+	return edge_flow
+
+
+def _draw_optimal_covering(dag, edge_flow, T, rng):
+	"""One random minimal edge covering as (chars, lengths) in the
+	ReasoningGenerator char format. The cover flow is decomposed into source-to-sink
+	traces by following a uniformly random out-edge with remaining flow at each step;
+	the result is P_min traces (the flow value) that together traverse every edge at
+	least once. Different `rng` draws give different minimal coverings of the same DAG.
+	"""
+	V, n = dag.V, dag.n
+	Vp = V ** (n - 1)
+	rem = defaultdict(dict)
+	for (u, v), f in edge_flow.items():
+		rem[u][v] = int(f)
+	is_sink = dag.is_sink
+	paths = []                                   # each is a node sequence u_1 -> ... -> u_{L+1}
+	for s in dag.source_vals.tolist():
+		for _ in range(int(sum(rem[s].values()))):
+			nodes = [s]
+			node = s
+			while not is_sink[node]:
+				choices = [w for w, fw in rem[node].items() if fw > 0]
+				node = int(choices[rng.integers(len(choices))])
+				nodes.append(node)
+			for u, v in zip(nodes[:-1], nodes[1:]):
+				rem[u][v] -= 1
+			paths.append(nodes)
+	num = len(paths)
+	chars = np.full((num, T), -1, dtype=np.int16)
+	lengths = np.full(num, 0, dtype=np.int32)
+	for i, nodes in enumerate(paths):
+		x = nodes[0]
+		for k in range(n):                       # first n chars spell the start node
+			chars[i, k] = x % V
+			x //= V
+		t = n
+		for nd in nodes[1:]:                     # each edge appends one char (= nd // Vp)
+			chars[i, t] = nd // Vp
+			t += 1
+		lengths[i] = t
+	return chars, lengths
+
+
+def samples_minimal_unit(profile, ordering, graph, seed, device, force):
+	"""
+	One point of samples_vs_edges_minimal: like samples_unit, but the training samples
+	are drawn from the *optimal* P_min edge covering rather than uniformly over paths.
+	Start from one random minimal covering (P_min traces covering every edge); if the
+	criteria are not met, draw another random covering and append it, and so on, up to
+	the same sample budget as samples_vs_edges. A fresh model is trained for one epoch
+	on the accumulated samples at each step, and the crossing gives the samples needed.
+	This is the control behind the claim that a minimal cover is *not* more sample
+	efficient: it weights all edges nearly equally and uses short traces, so it
+	under-represents the high-traffic transitions and long paths that dominate the test.
+	"""
+	V, n, S, N = graph
+	dag_seed = seed        # each seed draws a fresh DAG
+	sample_cap = int(profile['num_train_grid'][-1])     # same max budget as samples_vs_edges
+	spec = dict(kind='samples_minimal', ordering=ordering, V=V, n=n, S=S, N=N,
+				seed=seed, dag_seed=dag_seed, num_test=profile['num_test'],
+				sample_cap=sample_cap, model=profile['model'], train=profile['train'])
+
+	def compute():
+		dag = build_dag(V, n, S, N, ordering=ordering, seed=dag_seed)
+		gen = ReasoningGenerator(dag)
+		mcfg = _mcfg(profile)
+		tcfg = _tcfg(profile, device, seed)
+		device_r = resolve_device(tcfg.device)
+		dtype = _DTYPES[tcfg.dtype]
+		T = gen.max_chars
+		max_seq_len = gen.max_chars + 1
+		edge_flow = _cover_flow(dag)
+		test_chars, test_len = gen.sample(profile['num_test'], np.random.default_rng([seed, 2]))
+
+		coverings = []                                  # accumulated random coverings
+		def covering(i):
+			while len(coverings) <= i:
+				r = np.random.default_rng([seed, 10000 + len(coverings)])
+				coverings.append(_draw_optimal_covering(dag, edge_flow, T, r))
+			return coverings[i]
+		P_min = int(covering(0)[0].shape[0])            # traces per covering (flow value)
+
+		grid, illegal, path_cov = [], [], []
+		k = 1
+		while True:
+			chs = np.concatenate([covering(i)[0] for i in range(k)])
+			lns = np.concatenate([covering(i)[1] for i in range(k)])
+			model = build_model(V + 1, max_seq_len, mcfg, device_r, dtype, tcfg.seed)
+			train_one_epoch(model, build_full_tokens(chs, lns, V), lns, n, tcfg)
+			seen_states = training_visits(chs, lns, dag)
+			m = evaluate(model, test_chars, test_len, dag, seen_states=seen_states,
+						 true_branch_p=gen.branch_p, device=device_r, batch_size=tcfg.batch_size)
+			grid.append(int(chs.shape[0]))              # total samples used so far
+			illegal.append(m['illegal_mass'])
+			path_cov.append(m['path_coverage'])
+			met = m['illegal_mass'] < ILLEGAL_CRIT and m['path_coverage'] > PATH_COV_CRIT
+			if met or chs.shape[0] >= sample_cap:
+				break
+			k = max(k + 1, int(math.ceil(k * 1.5)))     # geometric growth in #coverings
+
+		return dict(
+			V=V, n=n, seed=seed, ordering=ordering, bin_width=None,
+			num_edges=int(dag.num_edges), distinct_edges=int(dag.num_edges),
+			num_states=int(dag.num_nodes), P_min=P_min,
+			grid=grid, illegal=illegal, path_coverage=path_cov,
+			samples_illegal=_crossing(grid, illegal, ILLEGAL_CRIT, want_below=True),
+			samples_coverage=_crossing(grid, path_cov, PATH_COV_CRIT, want_below=False),
+			censored_left=bool(illegal[0] <= ILLEGAL_CRIT),
+			censored_right=bool(illegal[-1] > ILLEGAL_CRIT),
+		)
+
+	return _cached_unit(spec, compute, force)[0]
+
+
 def _train_short_test_full(V, n, S, N, L, num_train, num_test, ordering,
 						   dag_seed, seed, mcfg, tcfg, epochs, window=None, augment=False,
 						   num_hints=0, force=False):
@@ -1023,6 +1151,76 @@ def build_samples_vs_edges(profile, ordering, devices, force, name):
 	print(f"[{name}] saved {path}.pdf/.png (+ {name}.json, {name}_provenance.json)")
 
 
+def plot_samples_vs_edges_minimal(results, name):
+	"""
+	Like plot_samples_vs_edges but trained on the optimal P_min edge covering: one
+	point per graph (mean over seeds), x = edges, y = samples to reach each criterion
+	(illegal blue, coverage green), log-log with a solid power-law fit. Standalone
+	(own labeled 'Samples' axis); there is no remapped control for this variant.
+	"""
+	fig, ax = plt.subplots(figsize=(3, 2.5))
+	graphs = []
+	for r in results:
+		g = (r['V'], r['n'])
+		if g not in graphs:
+			graphs.append(g)
+
+	any_pts = False
+	fits = {}
+	fit_lines = []
+	for key, col in [('samples_illegal', CURVE_COLORS[0]), ('samples_coverage', CURVE_COLORS[1])]:
+		fx, fy = [], []
+		for g in graphs:
+			group = [r for r in results if (r['V'], r['n']) == g]
+			a = _agg_over_seeds(group, key, drop_censored=True) if group else None
+			if not a:
+				continue
+			edges = float(np.mean([r['distinct_edges'] for r in group]))
+			any_pts = True
+			ax.errorbar(edges, a[0], yerr=a[1], fmt='o', ms=3.8, color=col,
+						ecolor=col, elinewidth=0.7, capsize=0, alpha=0.85, zorder=3)
+			fx.append(edges)
+			fy.append(a[0])
+		fits[key] = _loglog_fit(fx, fy)
+		if fits[key]:
+			fit_lines.append((fits[key], col))
+
+	if any_pts:
+		ax.set_xscale('log')
+		ax.set_yscale('log')
+	xlim = ax.get_xlim()
+	gx_full = np.array(xlim)
+	for (b, c), col in fit_lines:
+		ax.plot(gx_full, c * gx_full ** b, ls='-', lw=1.6, color=col, zorder=0)
+	ax.set_xlim(xlim)
+	ax.set_xlabel('Edges', fontsize=LABEL_FS)
+	ax.set_ylabel('Samples', fontsize=LABEL_FS)
+	_style_axis(ax)
+	_legend(ax, [
+		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$P($invalid tokens$) < 0.05$'),
+		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label=r'path coverage $> 0.95$'),
+		Line2D([], [], color='0.35', ls='-', lw=1.6, label='fit'),
+	], loc='upper left')
+	return _save(fig, name), fits
+
+
+def build_samples_vs_edges_minimal(profile, ordering, devices, force, name):
+	"""Train on samples from the optimal P_min edge covering (samples_minimal_unit) and
+	plot samples-to-criterion vs edges. The control behind the note that a minimal
+	cover is not more sample efficient than uniform sampling."""
+	jobs = [dict(profile=profile, ordering=ordering, graph=tuple(g), seed=seed)
+			for g in profile['graphs']
+			for seed in profile['seeds']]
+	print(f"[{name}] {len(jobs)} units")
+	results = _run_units(samples_minimal_unit, jobs, devices, force, desc=name)
+	os.makedirs(FIG_DIR, exist_ok=True)
+	with open(os.path.join(FIG_DIR, name + '.json'), 'w') as f:
+		json.dump(results, f, indent=1)
+	path, fits = plot_samples_vs_edges_minimal(results, name)
+	write_provenance(name, 'samples', profile, ordering, results, fits=fits)
+	print(f"[{name}] saved {path}.pdf/.png (+ {name}.json, {name}_provenance.json)")
+
+
 def build_sample_efficiency_vs_edges(profile, ordering, devices, force, name):
 	"""Reuse the cached samples_vs_edges results (no retraining) and plot sample
 	efficiency = (min paths to cover all edges) / samples. Reads the samples figure
@@ -1076,6 +1274,10 @@ FIGURES = {
 	# position-augmented training: random non-contiguous RoPE position gaps on the short paths
 	'length_vs_Lmax_augmented': lambda p, d, f: build_length_vs_Lmax(p, 'random', d, f, 'length_vs_Lmax_augmented', augmented=True),
 	'length_vs_Lmax_augmented_digit_sum': lambda p, d, f: build_length_vs_Lmax(p, 'digit_sum', d, f, 'length_vs_Lmax_augmented_digit_sum', augmented=True),
+	# --minimal: samples_vs_edges but trained on the optimal P_min edge covering (control:
+	# a minimal cover is not more sample efficient than uniform sampling)
+	'samples_vs_edges_minimal': lambda p, d, f: build_samples_vs_edges_minimal(p, 'random', d, f, 'samples_vs_edges_minimal'),
+	'samples_vs_edges_minimal_digit_sum': lambda p, d, f: build_samples_vs_edges_minimal(p, 'digit_sum', d, f, 'samples_vs_edges_minimal_digit_sum'),
 	# the k-hint length figure is produced via `--hints k` (build_length_vs_Lmax with
 	# hint_index=k), reusing the shared length units -- no separate FIGURES entry.
 }
@@ -1104,6 +1306,9 @@ def main():
 	ap.add_argument('--augmented', action='store_true',
 					help="also repeat length_vs_Lmax with random RoPE position "
 						 "augmentation on the short training paths (off by default)")
+	ap.add_argument('--minimal', action='store_true',
+					help="also make samples_vs_edges_minimal: samples_vs_edges trained on "
+						 "the optimal P_min edge covering instead of uniform paths (off by default)")
 	ap.add_argument('--hints', type=int, default=0, metavar='K',
 					help=f"make length_vs_Lmax_Khints: the length figure with K free "
 						 f"ground-truth hints per path (K <= {HINT_MAX}); reuses the shared "
@@ -1134,7 +1339,8 @@ def main():
 		names = [f for f in FIGURES
 				 if (args.digit_sum or not f.endswith('_digit_sum'))
 				 and (args.windowed_attention or '_windowed' not in f)
-				 and (args.augmented or '_augmented' not in f)]
+				 and (args.augmented or '_augmented' not in f)
+				 and (args.minimal or '_minimal' not in f)]
 
 	# --hints K *adds* the K-hint length figure(s) on top of the selection above,
 	# reusing the shared length units (no retrain). One per active ordering, so

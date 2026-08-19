@@ -38,7 +38,7 @@ def parse_args():
     p.add_argument('--gen-temperature', type=float, default=0.6, help="sampling temperature.")
     p.add_argument('--gen-top-p', type=float, default=0.95, help="nucleus (top-p) sampling.")
     p.add_argument('--gen-seed', type=int, default=42, help="seed for problem sampling + decoding.")
-    p.add_argument('--gen-batch-size', type=int, default=64,
+    p.add_argument('--gen-batch-size', type=int, default=32,
                    help="problems generated in parallel per batch (rolling-KV-cache path).")
     p.add_argument('--gen-full-batch-size', type=int, default=8,
                    help="batch size used only for the full-context reference column, "
@@ -54,7 +54,7 @@ def parse_args():
                         "(bare indices like 0 1 also accepted). Sets "
                         "CUDA_VISIBLE_DEVICES; the model is sharded across them. "
                         "Default: all visible GPUs.")
-    p.add_argument('--knockout-gen-ns', type=str, default="20,30,40,50,60,70,80,90,100,120,140,160,180,200",
+    p.add_argument('--knockout-gen-ns', type=str, default="20,30,40,50,60,70,80,90,100,120,140,160,180,200,400,500,600,700,800,900,1000",
                    help="comma-separated memory-window sizes n (prompt + n most recent "
                         "tokens) to sweep, roughly 10 values.")
     # ---- knockout experiment ----
@@ -1210,7 +1210,6 @@ def plot_knockout_generation_results(results, n_values):
     base_ticks = [int(t) for t in x if t % 40 == 0]
     if any_full:
         ax.set_xticks(base_ticks + [x_full]); ax.set_xticklabels([str(t) for t in base_ticks] + ["full"])
-    ax.legend(loc='upper left', frameon=False, handlelength=1.5)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     os.makedirs(FIGURES_DIR, exist_ok=True)
@@ -1268,6 +1267,57 @@ def plot_knockout_generation_lengths(table, n_values):
         plt.savefig(output_path + ".png", dpi=300, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
         plt.close()
+
+def plot_knockout_generation_lengths_combined(table, n_values):
+    """Mean reasoning length of CORRECT answers vs memory window n, ONE curve per
+    benchmark on a single axis, with +/-1 SEM shading and a 'full'-context point
+    at the right end. Restricting to correct answers avoids the non-terminating
+    small-n loops (which run to the cap) inflating the means. Built from the cached
+    per-n length stats in `table`, so it regenerates from cache (--plot-only)."""
+    print("Generating Combined Knockout-Generation Reasoning-Length Plot...")
+    plt.rcParams.update({'font.size': 12, 'axes.labelsize': 14, 'axes.titlesize': 16,
+                         'xtick.labelsize': 12, 'ytick.labelsize': 12, 'legend.fontsize': 7})
+    fig, ax = plt.subplots(figsize=(3, 2.5))
+    styles = {'GSM8K': '#003366', 'MATH-500': '#2ca02c', 'GPQA': '#d62728'}
+    x = np.asarray(n_values, dtype=float)
+    step = (x[-1] - x[-2]) if len(x) > 1 else 10.0
+    gap = max(2.0 * step, 20.0)
+    x_full = x.max() + gap
+    any_full = False
+    for name, color in styles.items():
+        if name not in table:
+            continue
+        by_n = table[name]['by_n']
+        mean = np.array([by_n[n]['mean_correct'] for n in n_values], dtype=float)
+        sem = np.array([by_n[n]['sem_correct'] for n in n_values], dtype=float)
+        ax.plot(x, mean, label=disp(name), color=color, linestyle='-', linewidth=1.8, zorder=3)
+        ax.fill_between(x, mean - sem, mean + sem, color=color, alpha=0.25,
+                        linewidth=0, zorder=2)
+        fm, fs = by_n[GEN_FULL_N]['mean_correct'], by_n[GEN_FULL_N]['sem_correct']
+        if np.isfinite(fm):
+            ax.errorbar([x_full], [fm], yerr=[fs if np.isfinite(fs) else 0.0],
+                        fmt='o', color=color, ms=5, capsize=0, elinewidth=.9, zorder=5)
+            any_full = True
+    if any_full:
+        ax.axvline(x.max() + gap / 2.0, color='0.85', lw=0.8, ls=(0, (2, 2)), zorder=0)
+    ax.set_xlabel(r"Memory Size (Tokens)")
+    ax.set_ylabel("Length (Tokens)")
+    ax.set_ylim(bottom=0.0)
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))  # ->  x10^4 offset, shorter labels
+    ax.yaxis.get_offset_text().set_size(10)
+    ax.set_xlim(right=(x_full + step) if any_full else x.max())
+    base_ticks = list(range(50, int(x.max()) + 1, 50))   # sparse ticks so labels + "full" don't collide
+    if any_full:
+        ax.set_xticks(base_ticks + [x_full])
+        ax.set_xticklabels([str(t) for t in base_ticks] + ["full"])
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    os.makedirs(FIGURES_DIR, exist_ok=True)
+    output_path = os.path.join(FIGURES_DIR, "knockout_gen_length_combined")
+    plt.savefig(output_path + ".pdf", dpi=300, bbox_inches="tight")
+    plt.savefig(output_path + ".png", dpi=300, bbox_inches="tight")
+    print(f"Saved plot to {output_path}")
+    plt.close()
 
 # -----------------------------------------------------------------------------
 # MAIN
@@ -1625,6 +1675,7 @@ def run_knockout_generation(tokenizer):
 
     plot_knockout_generation_results(results, n_values)
     plot_knockout_generation_lengths(table, n_values)
+    plot_knockout_generation_lengths_combined(table, n_values)
 
 EXPERIMENTS = {
     "knockout": run_knockout,
