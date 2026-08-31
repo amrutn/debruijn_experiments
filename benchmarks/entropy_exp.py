@@ -1178,6 +1178,25 @@ def plot_knockout_results(results, n_values):
     print(f"Saved plot to {output_path}")
     plt.close()
 
+def _setup_memory_log_xaxis(ax, x, x_full, any_full):
+    """Shared log x-axis for the knockout-generation plots so both are identical:
+    matplotlib-style decade ticks (10^k), plus a 'full' tick at x_full. 'full' is a
+    real tick label, so it renders at the same height as the numeric labels (not an
+    annotation below them). A dashed line marks the sweep/full break."""
+    ax.set_xscale('log')
+    ax.minorticks_off()                                   # drop crowded 2x10^1 minor labels
+    ax.set_xlim(x.min() * 0.9, (x_full * 1.2) if any_full else x.max() * 1.05)
+    ks = [k for k in range(int(np.floor(np.log10(x.min()))), int(np.floor(np.log10(x.max()))) + 1)
+          if x.min() <= 10 ** k <= x.max()]
+    ticks = [10 ** k for k in ks]
+    labels = [rf"$10^{{{k}}}$" for k in ks]
+    if any_full:
+        ax.axvline(np.sqrt(x.max() * x_full), color='0.85', lw=0.8, ls=(0, (2, 2)), zorder=0)
+        ticks = ticks + [x_full]
+        labels = labels + ["full"]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(labels)
+
 def plot_knockout_generation_results(results, n_values):
     """Accuracy vs memory window n, one line per benchmark, with +/-1 SEM shading."""
     print("Generating Knockout-Generation Accuracy Plot...")
@@ -1186,9 +1205,7 @@ def plot_knockout_generation_results(results, n_values):
     fig, ax = plt.subplots(figsize=(3, 2.5))
     styles = {'GSM8K': '#003366', 'MATH-500': '#2ca02c', 'GPQA': '#d62728'}
     x = np.asarray(n_values, dtype=float)
-    step = (x[-1] - x[-2]) if len(x) > 1 else 10.0
-    gap = max(2.0 * step, 20.0)
-    x_full = x.max() + gap
+    x_full = x.max() * 2.2           # 'full' point sits past the sweep on the log axis
     any_full = any(np.isfinite(results.get(nm, {}).get('full_acc', np.nan)) for nm in styles)
     for name, color in styles.items():
         if name in results:
@@ -1201,15 +1218,10 @@ def plot_knockout_generation_results(results, n_values):
             if np.isfinite(fa):
                 ax.errorbar([x_full], [fa], yerr=[results[name].get('full_sem', 0.0)],
                             fmt='o', color=color, ms=5, capsize=0, elinewidth=.9, zorder=5)
-    if any_full:
-        ax.axvline(x.max() + gap / 2.0, color='0.85', lw=0.8, ls=(0, (2, 2)), zorder=0)
     ax.set_xlabel(r"Memory Size (Tokens)")
     ax.set_ylabel("Accuracy")
     ax.set_ylim(bottom=0.0, top=1.0)
-    ax.set_xlim(right=(x_full + step) if any_full else x.max())
-    base_ticks = [int(t) for t in x if t % 40 == 0]
-    if any_full:
-        ax.set_xticks(base_ticks + [x_full]); ax.set_xticklabels([str(t) for t in base_ticks] + ["full"])
+    _setup_memory_log_xaxis(ax, x, x_full, any_full)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     os.makedirs(FIGURES_DIR, exist_ok=True)
@@ -1228,9 +1240,7 @@ def plot_knockout_generation_lengths(table, n_values):
     plt.rcParams.update({'font.size': 12, 'axes.labelsize': 14, 'axes.titlesize': 16,
                          'xtick.labelsize': 12, 'ytick.labelsize': 12, 'legend.fontsize': 7})
     x = np.asarray(n_values, dtype=float)
-    step = (x[-1] - x[-2]) if len(x) > 1 else 10.0
-    gap = max(2.0 * step, 20.0)
-    x_full = x.max() + gap
+    x_full = x.max() * 2.2           # 'full' point sits past the sweep on the log axis
     series = [('correct', 'Correct', '#2ca02c'), ('incorrect', 'Incorrect', '#d62728')]
     os.makedirs(FIGURES_DIR, exist_ok=True)
     for name in table:
@@ -1248,16 +1258,10 @@ def plot_knockout_generation_lengths(table, n_values):
                 ax.errorbar([x_full], [fm], yerr=[fs if np.isfinite(fs) else 0.0],
                             fmt='o', color=color, ms=5, capsize=0, elinewidth=.9, zorder=5)
                 any_full = True
-        if any_full:
-            ax.axvline(x.max() + gap / 2.0, color='0.85', lw=0.8, ls=(0, (2, 2)), zorder=0)
         ax.set_xlabel(r"Memory Size (Tokens)")
         ax.set_ylabel("Mean Reasoning Length")
         ax.set_ylim(bottom=0.0)
-        ax.set_xlim(right=(x_full + step) if any_full else x.max())
-        base_ticks = [int(t) for t in x if t % 40 == 0]
-        if any_full:
-            ax.set_xticks(base_ticks + [x_full])
-            ax.set_xticklabels([str(t) for t in base_ticks] + ["full"])
+        _setup_memory_log_xaxis(ax, x, x_full, any_full)
         ax.legend(title=disp(name), loc='center left', frameon=False, handlelength=1.5)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
@@ -1280,9 +1284,7 @@ def plot_knockout_generation_lengths_combined(table, n_values):
     fig, ax = plt.subplots(figsize=(3, 2.5))
     styles = {'GSM8K': '#003366', 'MATH-500': '#2ca02c', 'GPQA': '#d62728'}
     x = np.asarray(n_values, dtype=float)
-    step = (x[-1] - x[-2]) if len(x) > 1 else 10.0
-    gap = max(2.0 * step, 20.0)
-    x_full = x.max() + gap
+    x_full = x.max() * 2.2           # 'full' point sits past the sweep on the log axis
     any_full = False
     for name, color in styles.items():
         if name not in table:
@@ -1298,18 +1300,12 @@ def plot_knockout_generation_lengths_combined(table, n_values):
             ax.errorbar([x_full], [fm], yerr=[fs if np.isfinite(fs) else 0.0],
                         fmt='o', color=color, ms=5, capsize=0, elinewidth=.9, zorder=5)
             any_full = True
-    if any_full:
-        ax.axvline(x.max() + gap / 2.0, color='0.85', lw=0.8, ls=(0, (2, 2)), zorder=0)
     ax.set_xlabel(r"Memory Size (Tokens)")
     ax.set_ylabel("Length (Tokens)")
     ax.set_ylim(bottom=0.0)
     ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))  # ->  x10^4 offset, shorter labels
     ax.yaxis.get_offset_text().set_size(10)
-    ax.set_xlim(right=(x_full + step) if any_full else x.max())
-    base_ticks = list(range(50, int(x.max()) + 1, 50))   # sparse ticks so labels + "full" don't collide
-    if any_full:
-        ax.set_xticks(base_ticks + [x_full])
-        ax.set_xticklabels([str(t) for t in base_ticks] + ["full"])
+    _setup_memory_log_xaxis(ax, x, x_full, any_full)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     os.makedirs(FIGURES_DIR, exist_ok=True)
@@ -1672,6 +1668,22 @@ def run_knockout_generation(tokenizer):
                         f"{s['n_incorrect']},{_csv(s['mean_incorrect'])},"
                         f"{_csv(s['sem_incorrect'])},{s['hit']}\n")
     print(f"\nPer-n length summary (incl. correct/incorrect split) written to {summ_path}")
+
+    # smallest memory size n at which accuracy first reaches 75% of full-context accuracy
+    print("\nMemory size to exceed 75% of full-context accuracy:")
+    for name in order:
+        if name not in results:
+            continue
+        acc = np.asarray(results[name]['acc'], dtype=float)
+        full = results[name]['full_acc']
+        thr = 0.75 * full
+        hit = [(n, a) for n, a in zip(n_values, acc) if a >= thr]
+        if hit:
+            n0, a0 = hit[0]
+            print(f"  {name:<10} n={n0:<5d} (acc {a0:.3f} >= 0.75*{full:.3f} = {thr:.3f})")
+        else:
+            print(f"  {name:<10} not reached for n<={max(n_values)} "
+                  f"(max acc {acc.max():.3f} < {thr:.3f}; full {full:.3f})")
 
     plot_knockout_generation_results(results, n_values)
     plot_knockout_generation_lengths(table, n_values)

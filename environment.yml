@@ -39,6 +39,12 @@ dependencies:
       - torch>=2.2
       - einx>=0.4          # not packaged on conda-forge, so installed via pip
       # benchmarks/entropy_exp.py:
-      - transformers>=4.51 # >=4.51 for the Qwen3 architectures
+      - transformers>=4.56 # >=4.51 for Qwen3; >=4.56 for `dtype=` (torch_dtype deprecated)
       - datasets>=2.19     # loads the reasoning benchmarks / WikiText from the Hub
       - accelerate>=0.26   # required for device_map="auto" multi-GPU model sharding
+      # math/ (equation-solving experiment): LoRA fine-tunes of
+      # Qwen2.5-1.5B-Instruct, one per state-emission interval k. A full
+      # fine-tune needs ~25 GB for weights+grads+AdamW state and will not fit a
+      # 24 GB 4090, so peft/LoRA is required rather than optional.
+      - peft>=0.11         # LoRA adapters (math/train_eval.py)
+      - sympy>=1.12        # equation generation / factoring (math/generate_data.py)
