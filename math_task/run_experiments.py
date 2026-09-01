@@ -107,6 +107,11 @@ INJECT_PS = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0]
 # entirely, and one where traces frequently run to the step cap without answering.
 STD_ONLY_PS = (1.0,)
 
+# Perturbation probabilities kept out of the *figures* (still computed, still in the
+# printed tables). p = 0.5 is dropped: under that much perturbation the traces are
+# degraded enough that its curve adds clutter more than signal.
+PLOT_EXCLUDE_PS = (0.5,)
+
 # 1000 test problems rather than 500. State accuracy is measured per *report*, and
 # a trace emits floor(ops / k) of them, so the denominator shrinks as k grows: at
 # 500 problems the sparse high-k, high-p cells rested on so few reports that a zero
@@ -528,7 +533,7 @@ _MODE_LABEL = {'samples': 'fixed training samples',
 
 
 def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Test accuracy',
-                       subdir=''):
+                       subdir='', legend=True):
     """
     Held-out accuracy vs the state-emission interval k, one line per injection
     probability.
@@ -548,17 +553,16 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Test accuracy
     ks = sorted({r['interval'] for r in results
                  if r['interval'] is not None and r['interval'] <= PLOT_MAX_K})
     kmax = max(ks) if ks else 1
-    ps = sorted({r['inject_p'] for r in results})
+    ps = [p for p in sorted({r['inject_p'] for r in results})
+          if p not in PLOT_EXCLUDE_PS]
     colors = _inject_colors(ps)
     fig, ax = plt.subplots(figsize=(4.0, 2.8))
     if nocot is not None:
-        ax.axhline(nocot, color='#b03030', lw=1.1, ls=(0, (5, 3)), zorder=1)
-        # x is in data units: k = 1 is the leftmost point and the axis starts just
-        # below it, so 0.6 sat on the spine. Each 0.25 is roughly one character at
-        # this width, and 1.1 puts the label clear of both the spine and the k = 1
-        # markers.
+        # the no-reasoning floor, labelled inline. x is in data units: 1.1 puts the
+        # text clear of both the spine and the k = 1 markers.
+        ax.axhline(nocot, color='#e31a1c', lw=1.1, ls=(0, (5, 3)), zorder=1)
         ax.text(1.1, nocot + 0.022, 'no reasoning', fontsize=LEGEND_FS - 1,
-                color='#b03030', va='bottom')
+                color='#e31a1c', va='bottom')
 
     handles = []
     for p in ps:
@@ -574,9 +578,6 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Test accuracy
                 ax.plot([xs[-1], xstd], [ys[-1], ystd], ls=(0, (3, 2)), lw=1.2,
                         color=col, zorder=1)
             ax.plot([xstd], [ystd], marker='D', ms=5.5, color=col, ls='none', zorder=3)
-        # the level a metric would sit at if only the traces that escaped
-        # injection were scored correct -- the floor every variant shares
-        ax.axhline(no_injection_fraction(p), color=col, lw=0.9, alpha=0.3, zorder=0)
         # a probability evaluated only at standard has no curve, so show its
         # marker alone rather than a line the figure never draws
         handles.append(Line2D([], [], color=col, marker='o', ms=4, lw=1.5,
@@ -597,17 +598,16 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Test accuracy
 
     # two columns: six entries stacked vertically reach down into the curves,
     # whereas the strip above y~0.7 is empty for all but the smallest k
-    # opaque box: the no-injection floor lines run the full width and would
-    # otherwise read as strikethrough behind the labels
-    leg = ax.legend(handles=handles, title='Injection Prob.', fontsize=LEGEND_FS - 1,
-                    title_fontsize=LEGEND_FS - 1, frameon=True, loc='upper right',
-                    ncol=2, handlelength=1.2, handletextpad=0.4,
-                    labelspacing=0.25, columnspacing=1.0, borderaxespad=0.2,
-                    facecolor='white', edgecolor='0.8', framealpha=1.0,
-                    borderpad=0.35)
-    leg.get_frame().set_linewidth(0.7)
-    leg.set_zorder(10)
-    leg._legend_box.align = 'left'
+    if legend:
+        leg = ax.legend(handles=handles, title='Perturbation Probability', fontsize=LEGEND_FS - 1,
+                        title_fontsize=LEGEND_FS - 1, frameon=True, loc='upper right',
+                        ncol=2, handlelength=1.2, handletextpad=0.4,
+                        labelspacing=0.25, columnspacing=1.0, borderaxespad=0.2,
+                        facecolor='white', edgecolor='0.8', framealpha=1.0,
+                        borderpad=0.35)
+        leg.get_frame().set_linewidth(0.7)
+        leg.set_zorder(10)
+        leg._legend_box.align = 'left'
     return _save(fig, name, subdir)
 
 
@@ -835,7 +835,7 @@ def plot_state_tracking_vs_k(state, name='math_state_tracking_vs_k', subdir=''):
     if not rows:
         return None
     ks = sorted({k for k, _ in rows})
-    ps = sorted({pp for _, pp in rows})
+    ps = [pp for pp in sorted({pp for _, pp in rows}) if pp not in PLOT_EXCLUDE_PS]
     colors = _inject_colors(ps)
 
     fig, ax = plt.subplots(figsize=(4.0, 2.8))
@@ -916,7 +916,7 @@ def plot_state_discordance_vs_k(state, name='math_state_discordance_vs_k', subdi
     ks = sorted({k for k, _ in rows})
     # colour from the full injection grid so each p keeps the colour it has in the
     # state accuracy figure, whether we draw all of them or only a subset.
-    all_ps = sorted({pp for _, pp in rows})
+    all_ps = [pp for pp in sorted({pp for _, pp in rows}) if pp not in PLOT_EXCLUDE_PS]
     colors = _inject_colors(all_ps)
     ps = all_ps if ps_shown is None else [pp for pp in ps_shown if pp in all_ps]
 
@@ -1219,7 +1219,8 @@ def main():
                                    pass_label=f'{5 * mi + 1}/{n_passes}')
         if deriv:
             dpath = plot_accuracy_vs_k(deriv, name=f'math_derivation_vs_k_{mode}',
-                                       ylabel='Derivation accuracy', subdir=sub)
+                                       ylabel='Derivation accuracy', subdir=sub,
+                                       legend=False)
             print(f'wrote {dpath}.pdf/.png')
             print_summary(deriv, mode, label='derivation accuracy (step sequence only)')
 
@@ -1257,7 +1258,7 @@ def main():
                 print(f'wrote {tpath}.pdf/.png')
             dpath = plot_state_discordance_vs_k(
                 state, name=f'math_state_discordance_vs_k_{mode}', subdir=sub,
-                ps_shown=(0.0, 0.05, 0.1))
+                ps_shown=None)          # all p (p=0.5 dropped via PLOT_EXCLUDE_PS)
             if dpath:
                 print(f'wrote {dpath}.pdf/.png')
             print_state_tracking(state, results)
