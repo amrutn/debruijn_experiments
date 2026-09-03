@@ -247,10 +247,10 @@ _INJECT_CMAP = mcolors.LinearSegmentedColormap.from_list(
 
 
 # p = 1.0 sits outside the ramp: it is a different kind of condition (no
-# model-authored operation survives at all) and is drawn for standard alone, so it
-# gets black rather than the lightest blue, which would read as one more step in
-# an ordered series.
-_FULL_INJECT_COLOR = '#111111'
+# model-authored operation survives at all) and is drawn for standard alone. It
+# gets a light blue past the end of the ramp -- distinct from every ramp step and
+# from the black no-reasoning baseline.
+_FULL_INJECT_COLOR = '#9ecae1'
 
 
 def _inject_colors(ps):
@@ -532,7 +532,7 @@ _MODE_LABEL = {'samples': 'fixed training samples',
                'compute_rec': 'fixed token budget + recovery fine-tune'}
 
 
-def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Test accuracy',
+def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Final-Answer Accuracy',
                        subdir='', legend=True):
     """
     Held-out accuracy vs the state-emission interval k, one line per injection
@@ -560,9 +560,9 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Test accuracy
     if nocot is not None:
         # the no-reasoning floor, labelled inline. x is in data units: 1.1 puts the
         # text clear of both the spine and the k = 1 markers.
-        ax.axhline(nocot, color='#e31a1c', lw=1.1, ls=(0, (5, 3)), zorder=1)
+        ax.axhline(nocot, color='black', lw=1.1, ls=(0, (5, 3)), zorder=1)
         ax.text(1.1, nocot + 0.022, 'no reasoning', fontsize=LEGEND_FS - 1,
-                color='#e31a1c', va='bottom')
+                color='black', va='bottom')
 
     handles = []
     for p in ps:
@@ -589,7 +589,7 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Test accuracy
     # other one (always keeping the first and last) plus the standard point
     shown = set(ks[::2]) | {ks[0], ks[-1]} if ks else set()
     ax.set_xticks(ks + [_xpos(None, kmax)])
-    ax.set_xticklabels([str(k) if k in shown else '' for k in ks] + ['std'])
+    ax.set_xticklabels([str(k) if k in shown else '' for k in ks] + ['std.'])
     ax.axvline(kmax + 0.8, color='0.85', lw=0.8, zorder=0)   # separates std
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel('Interval $k$', fontsize=LABEL_FS)

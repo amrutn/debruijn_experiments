@@ -8,11 +8,13 @@ length.
 
 One figure puts problem length on the x-axis and draws two curves per condition:
 test accuracy as a solid line with circle markers and derivation accuracy as a
-dashed line with diamond markers. Conditions are k = 1, 3, 5 (coloured along a
-warm ramp, distinct from the blue injection ramp) and the standard condition
-(black); the other intervals are dropped to keep the figure legible. A light
-vertical line at length 12 marks where the training data ends, so the trained
-range (left of it) and the extrapolation range (right) read at a glance.
+dashed line with diamond markers. Conditions are k = 1, 3, 5 and the standard
+condition, coloured along a warm ramp (dark red = small k, standard at the light
+end), distinct from the blue perturbation ramp. No-CoT is added as a single black
+test-accuracy line -- the no-reasoning baseline. The other intervals are dropped to
+keep the figure legible. A light vertical line at length 12 marks where the
+training data ends, so the trained range (left) and extrapolation range (right)
+read at a glance.
 
 The question is whether local structure buys length generalisation. A model that
 genuinely chains single operations has no reason to care how many of them there
@@ -78,7 +80,7 @@ _COND_CMAP = mcolors.LinearSegmentedColormap.from_list(
 
 import generate_data as G
 from generate_data import (derivation_correct, parse_answers, is_correct,
-                           make_dataset, Problem)
+                           make_dataset, Problem, NO_COT)
 from train_eval import (get_or_decode, train_adapter, load_for_eval, _key,
                         _decode_path, DATA_CACHE)
 import run_experiments as R
@@ -109,9 +111,10 @@ def _empty_cuda():
 # the 12 boundary with a vertical line.
 LENGTHS = tuple(range(3, 17))   # operations per problem; training ran 3-12
 # The conditions the figure draws (and therefore the only ones decoded here):
-# k = 1, 3, 5 plus the standard condition. The other intervals are dropped to keep
-# the combined test/derivation figure from over-crowding.
-CONDS = [1, 3, 5, None]
+# k = 1, 3, 5, the standard condition, and no-CoT (the black no-reasoning baseline,
+# plotted as a single test-accuracy line). The other intervals are dropped to keep
+# the figure from over-crowding.
+CONDS = [1, 3, 5, None, NO_COT]
 # 250 problems per length. This sets `_eval_cfg`, hence the decode cache key, so
 # any decodes cached under a different count stay on disk unused rather than reused
 # -- there is no way to extend a cached decode in place, so changing this re-decodes
@@ -425,43 +428,55 @@ def print_length_gen(rows, mode):
         print(f'  {R._cond_label(k):>4}  ' + '  '.join(cells))
 
 
-def _cond_colors(ks):
+# The interval conditions are packed into the darker part of the warm ramp (so the
+# gaps between k = 1, 3, 5 stay small) and standard is placed at the light end,
+# roughly where k = 5 used to sit -- not the extreme, so it stays visible. No-CoT is
+# off this ramp entirely: it is the black no-reasoning baseline.
+_K_RAMP_MAX = 0.6
+
+
+def _ramp_colors(ks, has_std):
     """
-    One colour per interval k, evenly spaced (by rank) along the warm `_COND_CMAP`
-    ramp -- dark red for the smallest k, light orange for the largest -- kept
-    distinct from the blue injection ramp so k is not confused with p. The standard
-    condition is not a value of k and is drawn in black instead (see `_plot`).
+    Warm colour per interval k (compressed into `[0, _K_RAMP_MAX]`, dark -> light)
+    plus, if present, the standard condition at the light end of the ramp.
     """
-    ramp = sorted(ks)
-    n = max(len(ramp) - 1, 1)
-    return {k: _COND_CMAP(i / n) for i, k in enumerate(ramp)}
+    out = {}
+    order = sorted(ks)
+    m = max(len(order) - 1, 1)
+    for i, k in enumerate(order):
+        out[k] = _COND_CMAP(_K_RAMP_MAX * i / m)
+    if has_std:
+        out[None] = _COND_CMAP(1.0)
+    return out
 
 
 def _plot(rows, mode, subdir=''):
     """
     Test and derivation accuracy vs problem length, one colour per condition.
 
-    Problem length is the x-axis. Each condition contributes two curves in its own
-    colour: test accuracy as a solid line with circle markers and derivation
-    accuracy as a dashed line with diamond markers. The interval conditions
-    k = 1, 3, 5 take colours off the warm `_COND_CMAP` ramp; the standard condition
-    is drawn in black. A light vertical line at the last trained length
-    (`R.DATA.max_ops`) separates the in-distribution range from the extrapolation
-    range to its right.
+    Problem length is the x-axis. Each interval condition and the standard condition
+    contribute two curves in their own colour: test accuracy as a solid line with
+    circle markers and derivation accuracy as a dashed line with diamond markers.
+    Interval conditions take warm colours (dark red = small k); standard sits at the
+    light end of that ramp. No-CoT is drawn as a single black test-accuracy line (it
+    emits no operations, so it has no derivation to score). A light vertical line at
+    the last trained length (`R.DATA.max_ops`) separates the in-distribution range
+    from the extrapolation range to its right.
     """
     ks = sorted({r['cond'] for r in rows if isinstance(r['cond'], int)})
     has_std = any(r['cond'] is None for r in rows)
+    has_nocot = any(r['cond'] == NO_COT for r in rows)
     lengths = sorted({r['length'] for r in rows})
     if not lengths or (not ks and not has_std):
         return None
     by = {(r['cond'], r['length']): r for r in rows}
-    colors = _cond_colors(ks)
+    colors = _ramp_colors(ks, has_std)
 
     fig, ax = plt.subplots(figsize=(4.0, 2.8))
     ax.axvline(R.DATA.max_ops, color='0.8', lw=1.0, zorder=0)   # training ends here
     series = [(k, colors[k], rf'$k={k}$') for k in ks]
     if has_std:
-        series.append((None, R._FULL_INJECT_COLOR, 'std'))
+        series.append((None, colors[None], 'std.'))
     handles = []
     for cond, col, label in series:
         xs = [L for L in lengths if (cond, L) in by]
@@ -473,6 +488,15 @@ def _plot(rows, mode, subdir=''):
                 marker='D', ms=3.6, lw=1.3, ls=(0, (3, 2)), color=col, zorder=2)
         handles.append(Line2D([], [], color=col, marker='o', ms=4, lw=1.5,
                               label=label))
+    # no-reasoning baseline: a single black test-accuracy line (no ops => no
+    # derivation to score, so no dashed twin)
+    if has_nocot:
+        xs = [L for L in lengths if (NO_COT, L) in by]
+        if xs:
+            ax.plot(xs, [by[(NO_COT, L)]['accuracy'] for L in xs],
+                    marker='o', ms=4.0, lw=1.5, color='black', zorder=2)
+            handles.append(Line2D([], [], color='black', marker='o', ms=4, lw=1.5,
+                                  label='no reasoning'))
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel('Problem length (operations)', fontsize=R.LABEL_FS)
     ax.set_ylabel('Accuracy', fontsize=R.LABEL_FS)
