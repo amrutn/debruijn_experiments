@@ -38,14 +38,18 @@ def parse_args():
     p.add_argument('--gen-temperature', type=float, default=0.6, help="sampling temperature.")
     p.add_argument('--gen-top-p', type=float, default=0.95, help="nucleus (top-p) sampling.")
     p.add_argument('--gen-seed', type=int, default=42, help="seed for problem sampling + decoding.")
-    p.add_argument('--gen-batch-size', type=int, default=32,
-                   help="problems generated in parallel per batch (rolling-KV-cache path).")
-    p.add_argument('--gen-full-batch-size', type=int, default=8,
+    p.add_argument('--gen-batch-size', type=int, default=128,
+                   help="problems generated in parallel per batch (rolling-KV-cache "
+                        "path). Default 128 targets a single 80GB H100 with a ~14B "
+                        "model (window-bounded KV, so the prefill activation is the "
+                        "limit). Dial down for smaller GPUs or a ~32B model (e.g. 24GB "
+                        "4090s: ~48; 32B on one H100: ~32).")
+    p.add_argument('--gen-full-batch-size', type=int, default=16,
                    help="batch size used only for the full-context reference column, "
                         "whose KV cache grows with the generation length (unlike the "
-                        "window-bounded knockout columns). Set smaller than "
-                        "--gen-batch-size to avoid OOM on long generations. "
-                        )
+                        "window-bounded knockout columns), so it needs a smaller batch "
+                        "than --gen-batch-size. Default 16 suits a 14B model on an 80GB "
+                        "H100; use ~4 on a 24GB GPU or for a 32B model.")
     p.add_argument('--gen-no-cache', action='store_true',
                    help="use the slow per-problem path (no batching / KV cache) as a "
                         "robustness fallback if the batched path misbehaves.")
@@ -77,6 +81,11 @@ def parse_args():
                    help="HF model id to evaluate (e.g. Qwen/Qwen3-32B, Qwen/Qwen3-14B). "
                         "Caches are namespaced per model, so switching does not clobber "
                         "another model's results.")
+    p.add_argument('--compare-model', type=str, default=None,
+                   help="HF model id whose CACHED knockout-generation results are "
+                        "overlaid as dashed curves on the accuracy/length plots (read "
+                        "only -- run the experiment once with --model <id> first to "
+                        "populate its cache). e.g. --compare-model Qwen/Qwen3-32B.")
     p.add_argument('--num-samples', type=int, default=None,
                    help="cap problems per dataset before computing (default: all; "
                         "use to bound cost, especially for GSM8K).")
@@ -102,7 +111,13 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 MODEL_NAME = ARGS.model
 # filesystem-safe per-model tag used to namespace every cache directory, so
 # results for different models (e.g. Qwen3-32B vs Qwen3-14B) never collide.
-MODEL_SLUG = re.sub(r'[^A-Za-z0-9._-]', '_', MODEL_NAME.split('/')[-1])
+def model_slug(model_id):
+    return re.sub(r'[^A-Za-z0-9._-]', '_', model_id.split('/')[-1])
+def model_short(model_id):
+    """Short label for legends, e.g. 'Qwen/Qwen3-32B' -> '32B'."""
+    m = re.search(r'\d+\.?\d*B', model_id)
+    return m.group(0) if m else model_slug(model_id)
+MODEL_SLUG = model_slug(MODEL_NAME)
 NUM_WIKI_SAMPLES = 5000         # WikiText passages to consider before filtering
 MAX_SEQ_LEN = 1024              # forward-pass / cached-trace length cap
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -154,7 +169,7 @@ def load_model(attn_implementation=None):
             from transformers import AutoConfig
             cfg = AutoConfig.from_pretrained(MODEL_NAME)
             with init_empty_weights():
-                probe = AutoModelForCausalLM.from_config(cfg, torch_dtype=kwargs['dtype'])
+                probe = AutoModelForCausalLM.from_config(cfg, dtype=kwargs['dtype'])
             probe.tie_weights()
             bal = get_balanced_memory(
                 probe, dtype=kwargs['dtype'], low_zero=True,   # keep GPU0 lighter
@@ -178,7 +193,7 @@ def load_model(attn_implementation=None):
 
 def get_gsm8k_data(n=None):
     print("Loading GSM8K...")
-    ds = load_dataset("gsm8k", "main", split="train")
+    ds = load_dataset("openai/gsm8k", "main", split="train")
     data_items = []
     
     selection = ds if n is None else ds.select(range(min(n, len(ds))))
@@ -237,7 +252,7 @@ def get_gpqa_data(n=None):
 def get_wikitext_data(n=100, min_char_len=200):
     print("Loading WikiText-2 (Normal Text)...")
     try:
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
         data_items = []
 
         # Filter for non-empty lines and meaningful content
@@ -753,7 +768,7 @@ def get_generation_items(name, n_samples, seed):
 
     items = []
     if name == "GSM8K":
-        ds = load_dataset("gsm8k", "main", split="test")
+        ds = load_dataset("openai/gsm8k", "main", split="test")
         for i in stable_idx(len(ds)):
             ex = ds[int(i)]
             gold = str(ex['answer']).split('####')[-1].strip().replace(',', '')
@@ -1001,8 +1016,11 @@ def knockout_generate_batch(model, tokenizer, prompts_ids, n, args, eos_ids, pad
 
 # ---- resumable per-(problem, n) correctness cache ----
 
+def gen_path_for(slug, name):
+    return os.path.join(KNOCKOUT_GEN_DIR, slug, f"{name}.npz")
+
 def gen_path(name):
-    return os.path.join(KNOCKOUT_GEN_DIR, MODEL_SLUG, f"{name}.npz")
+    return gen_path_for(MODEL_SLUG, name)
 
 # Cache identity does NOT include gen_samples / n_problems: sampling is a stable
 # permutation prefix, so a larger run reuses the smaller run's rows (extend the
@@ -1051,6 +1069,68 @@ def aggregate_gen(correct, n_values, requested):
         acc.append(p)
         sem.append(float(np.sqrt(max(p * (1 - p), 0) / vals.size)))
     return np.array(acc), np.array(sem)
+
+def gen_len_stats(lv, cv, cap):
+    """Count / mean / SEM of generated lengths for a set of (length, correct) cells
+    (-1 length = not computed), overall and split by correctness. `cap` counts
+    cells that hit the max-new-tokens limit."""
+    lv = np.asarray(lv, dtype=float)
+    cv = np.asarray(cv)
+    valid = lv >= 0
+    def stat(mask):
+        s = lv[mask]
+        n = int(s.size)
+        mean = float(s.mean()) if n else float('nan')
+        sem = (float(s.std(ddof=1) / np.sqrt(n)) if n > 1 else (0.0 if n == 1 else float('nan')))
+        return n, mean, sem
+    n_all, m_all, se_all = stat(valid)
+    n_cor, m_cor, se_cor = stat(valid & (cv == 1))
+    n_inc, m_inc, se_inc = stat(valid & (cv == 0))
+    return {'n': n_all, 'mean': m_all, 'sem': se_all,
+            'hit': int((lv[valid] >= cap).sum()),
+            'n_correct': n_cor, 'mean_correct': m_cor, 'sem_correct': se_cor,
+            'n_incorrect': n_inc, 'mean_incorrect': m_inc, 'sem_incorrect': se_inc}
+
+def build_gen_results_from_cache(slug, order, n_values, cap):
+    """Read a model's cached knockout-generation matrices (read only) and return
+    (results, table) over `n_values` + full, matching the shapes built during a
+    live run, for dashed comparison overlays. n absent from the model's cache
+    become NaN (the curve simply breaks there). Returns ({}, {}) if the model has
+    no cache at all."""
+    results, table = {}, {}
+    for name in order:
+        path = gen_path_for(slug, name)
+        if not os.path.exists(path):
+            continue
+        d = np.load(path, allow_pickle=False)
+        correct = d['correct']
+        lengths = (d['lengths'] if 'lengths' in d.files
+                   else np.full(correct.shape, -1, np.int32))
+        cns = [int(x) for x in d['n_values']]
+        acc, sem = [], []
+        for n in n_values:
+            if n in cns:
+                a, s = aggregate_gen(correct, cns, [n])
+                acc.append(float(a[0])); sem.append(float(s[0]))
+            else:
+                acc.append(np.nan); sem.append(0.0)
+        if GEN_FULL_N in cns:
+            fa, fs = aggregate_gen(correct, cns, [GEN_FULL_N])
+            full_acc, full_sem = float(fa[0]), float(fs[0])
+        else:
+            full_acc, full_sem = np.nan, 0.0
+        results[name] = {"acc": np.array(acc), "sem": np.array(sem),
+                         "full_acc": full_acc, "full_sem": full_sem}
+        empty = (np.array([], np.int32), np.array([], np.int8))
+        by_n = {}
+        for n in list(n_values) + [GEN_FULL_N]:
+            if n in cns:
+                j = cns.index(n)
+                by_n[n] = gen_len_stats(lengths[:, j], correct[:, j], cap)
+            else:
+                by_n[n] = gen_len_stats(*empty, cap)
+        table[name] = {'by_n': by_n}
+    return results, table
 
 # -----------------------------------------------------------------------------
 # 4. PLOTTING
@@ -1197,8 +1277,19 @@ def _setup_memory_log_xaxis(ax, x, x_full, any_full):
     ax.set_xticks(ticks)
     ax.set_xticklabels(labels)
 
-def plot_knockout_generation_results(results, n_values):
-    """Accuracy vs memory window n, one line per benchmark, with +/-1 SEM shading."""
+def _model_style_legend(ax, primary_label, cmp_label, loc):
+    """Small solid/dashed legend distinguishing the two models (only when a
+    comparison model is overlaid); benchmark identity stays color-coded."""
+    from matplotlib.lines import Line2D
+    handles = [Line2D([0], [0], color='0.25', ls='-', lw=1.8, label=primary_label),
+               Line2D([0], [0], color='0.25', ls='--', lw=1.8, label=cmp_label)]
+    ax.legend(handles=handles, loc=loc, frameon=False, handlelength=1.8)
+
+def plot_knockout_generation_results(results, n_values, results_cmp=None,
+                                     primary_label=None, cmp_label=None):
+    """Accuracy vs memory window n, one line per benchmark, with +/-1 SEM shading.
+    If `results_cmp` is given, that model is overlaid as dashed curves (hollow
+    'full' markers) in the same per-benchmark colors."""
     print("Generating Knockout-Generation Accuracy Plot...")
     plt.rcParams.update({'font.size': 12, 'axes.labelsize': 14, 'axes.titlesize': 16,
                          'xtick.labelsize': 12, 'ytick.labelsize': 12, 'legend.fontsize': 7})
@@ -1207,21 +1298,30 @@ def plot_knockout_generation_results(results, n_values):
     x = np.asarray(n_values, dtype=float)
     x_full = x.max() * 2.2           # 'full' point sits past the sweep on the log axis
     any_full = any(np.isfinite(results.get(nm, {}).get('full_acc', np.nan)) for nm in styles)
+
+    def _draw(res, color, dashed):
+        acc = np.asarray(res["acc"], dtype=float)
+        sem = np.asarray(res["sem"], dtype=float)
+        ax.plot(x, acc, color=color, linestyle='--' if dashed else '-', linewidth=1.8, zorder=3)
+        ax.fill_between(x, acc - sem, acc + sem, color=color, alpha=0.18 if dashed else 0.3,
+                        linewidth=0, zorder=2)
+        fa = res.get('full_acc', np.nan)
+        if np.isfinite(fa):
+            ax.errorbar([x_full], [fa], yerr=[res.get('full_sem', 0.0)], fmt='o', color=color,
+                        ms=5, capsize=0, elinewidth=.9, zorder=5,
+                        mfc='none' if dashed else color, mew=1.2)
+
     for name, color in styles.items():
         if name in results:
-            acc = np.asarray(results[name]["acc"], dtype=float)
-            sem = np.asarray(results[name]["sem"], dtype=float)
-            ax.plot(x, acc, label=disp(name), color=color, linestyle='-', linewidth=1.8, zorder=3)
-            ax.fill_between(x, acc - sem, acc + sem, color=color, alpha=0.3,
-                            linewidth=0, zorder=2)
-            fa = results[name].get('full_acc', np.nan)
-            if np.isfinite(fa):
-                ax.errorbar([x_full], [fa], yerr=[results[name].get('full_sem', 0.0)],
-                            fmt='o', color=color, ms=5, capsize=0, elinewidth=.9, zorder=5)
+            _draw(results[name], color, dashed=False)
+        if results_cmp and name in results_cmp:
+            _draw(results_cmp[name], color, dashed=True)
     ax.set_xlabel(r"Memory Size (Tokens)")
     ax.set_ylabel("Accuracy")
     ax.set_ylim(bottom=0.0, top=1.0)
     _setup_memory_log_xaxis(ax, x, x_full, any_full)
+    if results_cmp:
+        _model_style_legend(ax, primary_label, cmp_label, loc='upper left')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     os.makedirs(FIGURES_DIR, exist_ok=True)
@@ -1272,7 +1372,8 @@ def plot_knockout_generation_lengths(table, n_values):
         print(f"Saved plot to {output_path}")
         plt.close()
 
-def plot_knockout_generation_lengths_combined(table, n_values):
+def plot_knockout_generation_lengths_combined(table, n_values, table_cmp=None,
+                                              primary_label=None, cmp_label=None):
     """Mean reasoning length of CORRECT answers vs memory window n, ONE curve per
     benchmark on a single axis, with +/-1 SEM shading and a 'full'-context point
     at the right end. Restricting to correct answers avoids the non-terminating
@@ -1285,27 +1386,35 @@ def plot_knockout_generation_lengths_combined(table, n_values):
     styles = {'GSM8K': '#003366', 'MATH-500': '#2ca02c', 'GPQA': '#d62728'}
     x = np.asarray(n_values, dtype=float)
     x_full = x.max() * 2.2           # 'full' point sits past the sweep on the log axis
-    any_full = False
-    for name, color in styles.items():
-        if name not in table:
-            continue
-        by_n = table[name]['by_n']
+    any_full = [False]
+
+    def _draw(by_n, color, dashed):
         mean = np.array([by_n[n]['mean_correct'] for n in n_values], dtype=float)
         sem = np.array([by_n[n]['sem_correct'] for n in n_values], dtype=float)
-        ax.plot(x, mean, label=disp(name), color=color, linestyle='-', linewidth=1.8, zorder=3)
-        ax.fill_between(x, mean - sem, mean + sem, color=color, alpha=0.25,
+        ax.plot(x, mean, color=color, linestyle='--' if dashed else '-', linewidth=1.8, zorder=3)
+        ax.fill_between(x, mean - sem, mean + sem, color=color, alpha=0.15 if dashed else 0.25,
                         linewidth=0, zorder=2)
         fm, fs = by_n[GEN_FULL_N]['mean_correct'], by_n[GEN_FULL_N]['sem_correct']
         if np.isfinite(fm):
-            ax.errorbar([x_full], [fm], yerr=[fs if np.isfinite(fs) else 0.0],
-                        fmt='o', color=color, ms=5, capsize=0, elinewidth=.9, zorder=5)
-            any_full = True
+            ax.errorbar([x_full], [fm], yerr=[fs if np.isfinite(fs) else 0.0], fmt='o', color=color,
+                        ms=5, capsize=0, elinewidth=.9, zorder=5,
+                        mfc='none' if dashed else color, mew=1.2)
+            any_full[0] = True
+
+    for name, color in styles.items():
+        if name in table:
+            _draw(table[name]['by_n'], color, dashed=False)
+        if table_cmp and name in table_cmp:
+            _draw(table_cmp[name]['by_n'], color, dashed=True)
+    any_full = any_full[0]
     ax.set_xlabel(r"Memory Size (Tokens)")
     ax.set_ylabel("Length (Tokens)")
     ax.set_ylim(bottom=0.0)
     ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))  # ->  x10^4 offset, shorter labels
     ax.yaxis.get_offset_text().set_size(10)
     _setup_memory_log_xaxis(ax, x, x_full, any_full)
+    if table_cmp:
+        _model_style_legend(ax, primary_label, cmp_label, loc='upper right')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     os.makedirs(FIGURES_DIR, exist_ok=True)
@@ -1590,29 +1699,12 @@ def run_knockout_generation(tokenizer):
         # generation-length stats over this benchmark's rows, split by correctness.
         # Derived entirely from the cached `lengths` + `correct` matrices, so these
         # tables regenerate from cache (e.g. with --plot-only) without any rerun.
-        def _len_stats(lv, cv):
-            """lv/cv: 1D length + correctness arrays for a set of cells (-1 = todo).
-            Returns count, mean and SEM overall and split by correctness."""
-            valid = lv >= 0
-            def stat(mask):
-                s = lv[mask].astype(float)
-                n = int(s.size)
-                mean = float(s.mean()) if n else float('nan')
-                sem = (float(s.std(ddof=1) / np.sqrt(n)) if n > 1
-                       else (0.0 if n == 1 else float('nan')))
-                return n, mean, sem
-            n_all, m_all, se_all = stat(valid)
-            n_cor, m_cor, se_cor = stat(valid & (cv == 1))
-            n_inc, m_inc, se_inc = stat(valid & (cv == 0))
-            return {'n': n_all, 'mean': m_all, 'sem': se_all,
-                    'hit': int((lv[valid] >= ARGS.gen_max_new_tokens).sum()),
-                    'n_correct': n_cor, 'mean_correct': m_cor, 'sem_correct': se_cor,
-                    'n_incorrect': n_inc, 'mean_incorrect': m_inc, 'sem_incorrect': se_inc}
-        by_n = {n: _len_stats(lengths[:nprob, cns.index(int(n))],
-                              correct[:nprob, cns.index(int(n))]) for n in all_cols}
+        cap = ARGS.gen_max_new_tokens
+        by_n = {n: gen_len_stats(lengths[:nprob, cns.index(int(n))],
+                                 correct[:nprob, cns.index(int(n))], cap) for n in all_cols}
         gcols = [cns.index(int(n)) for n in all_cols]
-        table[name] = {'overall': _len_stats(lengths[:nprob][:, gcols].ravel(),
-                                             correct[:nprob][:, gcols].ravel()),
+        table[name] = {'overall': gen_len_stats(lengths[:nprob][:, gcols].ravel(),
+                                                correct[:nprob][:, gcols].ravel(), cap),
                        'by_n': by_n}
 
     # ---- summary tables ----
@@ -1685,9 +1777,23 @@ def run_knockout_generation(tokenizer):
             print(f"  {name:<10} not reached for n<={max(n_values)} "
                   f"(max acc {acc.max():.3f} < {thr:.3f}; full {full:.3f})")
 
-    plot_knockout_generation_results(results, n_values)
+    # optional dashed overlay of a second model's cached results (e.g. 32B vs 14B)
+    results_cmp = table_cmp = cmp_label = None
+    if ARGS.compare_model and model_slug(ARGS.compare_model) != MODEL_SLUG:
+        cslug = model_slug(ARGS.compare_model)
+        rc, tc = build_gen_results_from_cache(cslug, order, n_values, ARGS.gen_max_new_tokens)
+        if rc:
+            results_cmp, table_cmp, cmp_label = rc, tc, model_short(ARGS.compare_model)
+            print(f"\nOverlaying comparison model {ARGS.compare_model} as dashed curves.")
+        else:
+            print(f"\n[compare] no cached knockout-generation results for "
+                  f"{ARGS.compare_model} under {os.path.join(KNOCKOUT_GEN_DIR, cslug)}; "
+                  f"run it first with --model {ARGS.compare_model}. Skipping overlay.")
+    primary_label = model_short(MODEL_NAME)
+
+    plot_knockout_generation_results(results, n_values, results_cmp, primary_label, cmp_label)
     plot_knockout_generation_lengths(table, n_values)
-    plot_knockout_generation_lengths_combined(table, n_values)
+    plot_knockout_generation_lengths_combined(table, n_values, table_cmp, primary_label, cmp_label)
 
 EXPERIMENTS = {
     "knockout": run_knockout,

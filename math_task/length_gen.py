@@ -7,11 +7,11 @@ steps past it -- and reports test accuracy and derivation accuracy at every
 length.
 
 One figure puts problem length on the x-axis and draws two curves per condition:
-test accuracy as a solid line with circle markers and derivation accuracy as a
-dashed line with diamond markers. Conditions are k = 1, 3, 5 and the standard
+final-answer accuracy as a solid line with circle markers and derivation accuracy
+as a dashed line with diamond markers. Conditions are k = 1, 3 and the standard
 condition, coloured along a warm ramp (dark red = small k, standard at the light
 end), distinct from the blue perturbation ramp. No-CoT is added as a single black
-test-accuracy line -- the no-reasoning baseline. The other intervals are dropped to
+final-answer line -- the no-reasoning baseline. The other intervals are dropped to
 keep the figure legible. A light vertical line at length 12 marks where the
 training data ends, so the trained range (left) and extrapolation range (right)
 read at a glance.
@@ -111,10 +111,10 @@ def _empty_cuda():
 # the 12 boundary with a vertical line.
 LENGTHS = tuple(range(3, 17))   # operations per problem; training ran 3-12
 # The conditions the figure draws (and therefore the only ones decoded here):
-# k = 1, 3, 5, the standard condition, and no-CoT (the black no-reasoning baseline,
-# plotted as a single test-accuracy line). The other intervals are dropped to keep
+# k = 1, 3, the standard condition, and no-CoT (the black no-reasoning baseline,
+# plotted as a single final-answer line). The other intervals are dropped to keep
 # the figure from over-crowding.
-CONDS = [1, 3, 5, None, NO_COT]
+CONDS = [1, 3, None, NO_COT]
 # 250 problems per length. This sets `_eval_cfg`, hence the decode cache key, so
 # any decodes cached under a different count stay on disk unused rather than reused
 # -- there is no way to extend a cached decode in place, so changing this re-decodes
@@ -472,7 +472,7 @@ def _plot(rows, mode, subdir=''):
     by = {(r['cond'], r['length']): r for r in rows}
     colors = _ramp_colors(ks, has_std)
 
-    fig, ax = plt.subplots(figsize=(4.0, 2.8))
+    fig, ax = plt.subplots(figsize=(3, 2.5))
     ax.axvline(R.DATA.max_ops, color='0.8', lw=1.0, zorder=0)   # training ends here
     series = [(k, colors[k], rf'$k={k}$') for k in ks]
     if has_std:
@@ -506,7 +506,7 @@ def _plot(rows, mode, subdir=''):
     ax.set_xticklabels([str(L) if L in shown else '' for L in lengths])
     R._style_axis(ax)
     handles += [Line2D([], [], color='0.35', lw=1.5, marker='o', ms=4,
-                       label='test'),
+                       label='final-answer'),
                 Line2D([], [], color='0.35', lw=1.3, ls=(0, (3, 2)), marker='D',
                        ms=3.6, label='derivation')]
     leg = ax.legend(handles=handles, fontsize=R.LEGEND_FS - 1, frameon=True,

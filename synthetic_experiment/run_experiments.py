@@ -952,7 +952,7 @@ def plot_sample_efficiency_vs_edges(results, name, mincover):
 	if any_pts:
 		ax.set_xscale('log')                           # x log, y linear
 	ax.set_xlabel('Edges', fontsize=LABEL_FS)
-	ax.set_ylabel('Sample Efficiency', fontsize=LABEL_FS)
+	ax.set_ylabel(rf'$P_{{\text{min}}}/$Samples', fontsize=LABEL_FS)
 	_style_axis(ax)
 	# both legends stacked at the top-left (criteria on top, plain/permuted below)
 	crit = _legend(ax, [

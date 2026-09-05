@@ -556,7 +556,7 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Final-Answer 
     ps = [p for p in sorted({r['inject_p'] for r in results})
           if p not in PLOT_EXCLUDE_PS]
     colors = _inject_colors(ps)
-    fig, ax = plt.subplots(figsize=(4.0, 2.8))
+    fig, ax = plt.subplots(figsize=(3, 2.5))
     if nocot is not None:
         # the no-reasoning floor, labelled inline. x is in data units: 1.1 puts the
         # text clear of both the spine and the k = 1 markers.
@@ -838,7 +838,7 @@ def plot_state_tracking_vs_k(state, name='math_state_tracking_vs_k', subdir=''):
     ps = [pp for pp in sorted({pp for _, pp in rows}) if pp not in PLOT_EXCLUDE_PS]
     colors = _inject_colors(ps)
 
-    fig, ax = plt.subplots(figsize=(4.0, 2.8))
+    fig, ax = plt.subplots(figsize=(3, 2.5))
     handles = []
     for pp in ps:
         col = colors[pp]
@@ -920,7 +920,7 @@ def plot_state_discordance_vs_k(state, name='math_state_discordance_vs_k', subdi
     colors = _inject_colors(all_ps)
     ps = all_ps if ps_shown is None else [pp for pp in ps_shown if pp in all_ps]
 
-    fig, ax = plt.subplots(figsize=(4.0, 2.8))
+    fig, ax = plt.subplots(figsize=(3, 2.5))
     for pp in ps:
         col = colors[pp]
         # only k with at least one discordant report have a defined split
@@ -942,14 +942,13 @@ def plot_state_discordance_vs_k(state, name='math_state_discordance_vs_k', subdi
     # figures that use the same injection ramp, so this legend lists only the two
     # line styles -- keeping it small enough to sit inside without covering curves.
     handles = [Line2D([], [], color='0.35', lw=1.5, marker='o', ms=4,
-                      label='drift (anchored ✓; cumulative ✗)'),
+                      label='drift'),
                Line2D([], [], color='0.35', lw=1.3, ls=(0, (3, 2)), marker='D',
-                      ms=3.6, label='recover (anchored ✗; cumulative ✓)')]
+                      ms=3.6, label='recover')]
     leg = ax.legend(handles=handles, fontsize=LEGEND_FS - 1, frameon=True,
-                    loc='upper right', bbox_to_anchor=(1.0, 1.08),
-                    handlelength=1.4, handletextpad=0.5, labelspacing=0.25,
-                    borderaxespad=0.0, facecolor='white', edgecolor='0.8',
-                    framealpha=1.0, borderpad=0.35)
+                    loc='center left', handlelength=1.4, handletextpad=0.5,
+                    labelspacing=0.25, borderaxespad=0.4, facecolor='white',
+                    edgecolor='0.8', framealpha=1.0, borderpad=0.35)
     leg.get_frame().set_linewidth(0.7)
     leg.set_zorder(10)
     return _save(fig, name, subdir)
@@ -1230,7 +1229,7 @@ def main():
                                      pass_label=f'{5 * mi + 2}/{n_passes}')
         if ignored:
             ipath = plot_accuracy_vs_k(ignored, name=f'math_ignored_vs_k_{mode}',
-                                       ylabel='Ignored accuracy', subdir=sub)
+                                       ylabel='Ignored Accuracy', subdir=sub)
             print(f'wrote {ipath}.pdf/.png')
             print_summary(ignored, mode,
                           label='ignored accuracy (injected steps dropped)')
@@ -1242,7 +1241,7 @@ def main():
                                       pass_label=f'{5 * mi + 3}/{n_passes}')
         if replaced:
             rpath = plot_accuracy_vs_k(replaced, name=f'math_replaced_vs_k_{mode}',
-                                       ylabel='Replaced accuracy', subdir=sub)
+                                       ylabel='Replaced Accuracy', subdir=sub)
             print(f'wrote {rpath}.pdf/.png')
             print_summary(replaced, mode,
                           label='replaced accuracy (injected steps corrected)')

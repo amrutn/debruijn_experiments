@@ -1,5 +1,7 @@
 __pycache__/
 *.txt
+!gsm8k_tuning/traces_ledger.txt
+!gsm8k_tuning/traces_distill_*.txt
 *.json
 *.csv
 .DS_Store

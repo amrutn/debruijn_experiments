@@ -1,0 +1,47 @@
+# Combined conda environment for the whole project -- CUDA 13.0 / single H100 variant.
+# Same packages as environment.yml; only the torch build (CUDA 13.0 wheels) and the
+# environment name differ. Use this on a CUDA-13.0 box (e.g. a single H100 80GB);
+# use environment.yml on Apple Silicon (MPS) or a CUDA-12.x box.
+#   - theory/                (theorem1_theorem2.py, theorem3.py, debruijn_dag_figure.py)
+#   - synthetic_experiment/  (generate_data.py, model.py, train_eval.py, run_experiments.py)
+#   - benchmarks/            (entropy_exp.py)
+#   - math/                  (equation-solving LoRA experiment)
+#
+# Single-GPU note: an H100 80GB holds Qwen3-14B and Qwen3-32B on one device, so no
+# multi-GPU sharding is needed -- pass a single device (e.g. `--devices cuda:0`), or
+# omit --devices. device_map="auto" then places the whole model on cuda:0; accelerate
+# is still required for that path and for the get_balanced_memory budgeting.
+#
+# Create with:  conda env create -f environment2.yml
+# Update with:  conda env update -f environment2.yml --prune
+name: ngram-experiments-cu130
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy>=2.0
+  - scipy>=1.11
+  - matplotlib>=3.8
+  - networkx>=3.0
+  - numba>=0.60          # provides numpy>=2 compatibility; conda resolves a matching numpy
+  - tqdm>=4.60           # progress bars for run_experiments.py
+  - pip>=23
+  - pip:
+      # torch: CUDA 13.0 build. PyPI's default torch (>=2.13) is already a CUDA-13
+      # wheel, so plain `pip install torch` works on a CUDA-13.0 driver; to pin the
+      # build explicitly use the matching cu130 index:
+      #   pip install "torch>=2.13" --index-url https://download.pytorch.org/whl/cu130
+      # Install the other pip packages with `--no-deps` (or after torch) so pip does
+      # not silently swap torch for a different CUDA build.
+      - torch>=2.13
+      - einx>=0.4          # not packaged on conda-forge, so installed via pip
+      # benchmarks/entropy_exp.py:
+      - transformers>=4.56 # >=4.51 for Qwen3; >=4.56 for `dtype=` (torch_dtype deprecated)
+      - datasets>=2.19     # loads the reasoning benchmarks / WikiText from the Hub
+      - accelerate>=0.26   # required for device_map="auto" model placement / budgeting
+      # math/ (equation-solving experiment): LoRA fine-tunes of
+      # Qwen2.5-1.5B-Instruct, one per state-emission interval k. A full
+      # fine-tune needs ~25 GB for weights+grads+AdamW state; peft/LoRA keeps it
+      # small (trivially fits an H100 80 GB).
+      - peft>=0.11         # LoRA adapters (math/train_eval.py)
+      - sympy>=1.12        # equation generation / factoring (math/generate_data.py)
