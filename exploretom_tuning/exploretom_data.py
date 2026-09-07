@@ -182,7 +182,7 @@ class DataConfig:
     from the sample.
     """
     n_train: int = 1500             # training rows (questions) from the training stories
-    n_test: int = 200               # test rows, from stories disjoint from the training ones
+    n_test: int = 250               # test rows, from stories disjoint from the training ones
     q_per_story: int = 4            # at most this many questions of one story, either split
     seed: int = 0                   # story order and the choice of questions within a split
     dataset: str = 'sample'         # 'sample' | 'generated'

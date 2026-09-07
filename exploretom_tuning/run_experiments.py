@@ -36,9 +36,11 @@ distill         optional (``--conditions ...,distill``): a LoRA trained on a
 The chain, state_tracking and narration targets are computed from the
 replayed story, so the exact conditions are trained on identical rows with
 identical labels and differ in the format of the reasoning only. Training is LoRA r=32 on every
-projection, lr 1e-4 cosine, effective batch 32, over four passes of the rows,
-one seed. While an adapter trains it is scored twenty times on the test set
-(`TrainConfig.curve_evals`), which gives the learning curve.
+projection, lr 1e-4 cosine, effective batch 32, over three passes of the rows.
+The whole thing is repeated over five seeds, each an independent train/test
+split (and training seed); results are averaged and the error bars are the SEM
+over the seeds. While an adapter trains it is scored twenty times on the test
+set (`TrainConfig.curve_evals`), which gives the learning curve.
 
 Datasets
 --------
@@ -51,15 +53,16 @@ tie). Pass `--dataset generated` or `--dataset sample` to run just one.
 Figures (pdf+png in figures/)
 -----------------------------
 exploretom_accuracy_<model>[_<teacher>][_gen-p<N>m<N>r<N>]
-                          Test accuracy per condition as a bar, with the
-                          binomial SEM over the test rows as an error bar
-                          (the SEM over seeds when there are several) and the
-                          untuned model's accuracy as a dashed line.
+                          Test accuracy per condition as a bar (mean over the
+                          seeds), with the SEM over the seeds as an error bar
+                          and each seed's own accuracy as a dot, and the untuned
+                          model's mean accuracy as a dashed line.
 exploretom_curve_<model>[_<teacher>][_gen-p<N>m<N>r<N>]
-                          Test accuracy against training samples, one line
-                          per fine-tuned condition starting from the untuned
-                          model at zero samples, with the untuned model's
-                          accuracy as a dashed horizontal line.
+                          Test accuracy against training samples, one line per
+                          fine-tuned condition (mean over seeds) starting from
+                          the untuned model at zero samples, a shaded +/-1 SEM
+                          band over the seeds, and the untuned model's accuracy
+                          as a dashed horizontal line.
 <model> is the base model, e.g. 'qwen2.5-1.5b-instruct'; <teacher> is the
 trace teacher's tag and appears only when the distill condition is run; the
 `_gen-...` suffix (people/moves/rooms) marks the generated set, so the two
@@ -128,25 +131,30 @@ FIG_DIR = os.path.join(HERE, 'figures')
 # the experiment
 # ----------------------------------------------------------------------------
 
-# 1,500 training questions from 375 stories and 200 test questions from 50
-# other stories (at most 4 questions per story), drawn once with seed 0.
-DATA = DataConfig(n_train=1500, n_test=200, q_per_story=4, seed=0)
+# 1,500 training questions and 250 test questions from disjoint stories (at
+# most 4 questions per story). The split seed varies per replicate (see SEEDS),
+# so `seed=0` here is only the first split.
+DATA = DataConfig(n_train=1500, n_test=250, q_per_story=4, seed=0)
 
 # The math task's adapter and optimiser settings: r=32 (~2.4% of the model);
 # batch 8 x 4 accumulation is the effective batch of 32 -- kept as 8 x 4 on
 # larger GPUs too, so the loss is averaged exactly as in the math task.
 MODEL = ModelConfig()
 TRAIN = TrainConfig(lr=1e-4, batch_size=8, grad_accum=4)
-PASSES = 4                      # sweeps over the training rows per adapter (epochs)
+PASSES = 3                      # sweeps over the training rows per adapter (epochs)
 
 # Greedy, batch 64: the 1.5B model's KV cache is small (2 KV heads, ~28 KB per
 # token), so 64 sequences of ~2.3k tokens use ~4 GB; `run_unit` halves the
 # batch on OOM. Not a cache key.
 EVAL = EvalConfig(max_new_tokens=2048, batch_size=64)
 
-# Training seeds per fine-tuned condition (LoRA init and sample order; the
-# rows are fixed). One: the error bar is the binomial one over the test rows.
-SEEDS = 1
+# Number of replicates. Each seed k is an INDEPENDENT run: a different
+# train/test split (`dcfg.seed = k`, so the test rows differ) and a different
+# training seed (LoRA init and sample order). Results are averaged over the
+# seeds and the error bars are the SEM over them -- the spread that reflects
+# both the data split and the training randomness. The untuned base model is
+# re-evaluated on each split.
+SEEDS = 5
 
 COND_LABEL = {'base': 'base', 'direct': 'direct', 'chain': 'chain',
               'state_tracking': 'state-tracking', 'narration': 'narration', 'distill': 'distill'}
@@ -157,17 +165,6 @@ def train_cfg(seed, base=None, n_rows=None):
     rows (default the subset size) at `seed`, from `base` (default `TRAIN`)."""
     n = DATA.n_train if n_rows is None else n_rows
     return replace(TRAIN if base is None else base, total_samples=n * PASSES, seed=seed)
-
-
-def unit_list(seeds, conditions=DEFAULT_CONDITIONS):
-    """Every (condition, seed) to run, in queue order: the base model once,
-    then each fine-tuned condition once per seed, in `CONDITIONS` order."""
-    units = []
-    for c in CONDITIONS:
-        if c not in conditions:
-            continue
-        units += [('base', None)] if c == 'base' else [(c, s) for s in range(seeds)]
-    return units
 
 
 # The model and optimisation settings of the current run: `MODEL` / `TRAIN`
@@ -323,7 +320,7 @@ def run_all(units, dcfg, trcfg, devices, force, setup=None):
 
     Work is handed out through a shared queue rather than pre-assigned, so a
     GPU that finishes early immediately picks up the next unit instead of
-    idling; the queue holds the units in `unit_list` order. The row sets are
+    idling; the queue holds the units in `CONDITIONS` order. The row sets are
     built here, in the parent, so the workers never race to build them.
     """
     setup = setup or Setup()
@@ -417,7 +414,8 @@ def print_plan(units, dcfg, trcfg, devices, force, setup=None):
     print('rough cost     : on an H100 or B200 ~3-10 min of training per adapter (the state-')
     print('                 tracking and narration targets are long) plus ~1-4 min per evaluation')
     print(f'                 of the test rows (x{tc.curve_evals + 1} with the curve), so ~20-60 min per unit;')
-    print('                 the default runs both datasets (~10 units), several hours on one GPU')
+    print(f'                 the default runs both datasets x {SEEDS} seeds -- many units, plan for')
+    print('                 the better part of a day on one GPU (everything caches/resumes)')
     print('-' * 66, flush=True)
 
 
@@ -510,10 +508,10 @@ def curve_stats(results):
     Per fine-tuned condition: the training-sample positions of the curve
     evaluations and the mean and SEM over seeds of the accuracy at each
     (seeds are aligned by evaluation index; they share the schedule). The
-    base model's point is prepended to every condition: at zero samples the
-    adapter is the base model.
+    untuned model is prepended as the zero-sample point of every curve, using
+    each seed's own base evaluation so its mean and SEM match the base bar.
     """
-    base = next((r['curve'][0] for r in results if r['cond'] == 'base' and r.get('curve')), None)
+    base_pts = [r['curve'][0] for r in results if r['cond'] == 'base' and r.get('curve')]
     out = {}
     for cond in CONDITIONS:
         if cond == 'base':
@@ -523,14 +521,15 @@ def curve_stats(results):
             continue
         n = min(len(c) for c in curves)
         pts = [[c[i] for c in curves] for i in range(n)]
-        if base is not None:
-            pts.insert(0, [base] * len(curves))
+        if base_pts:
+            pts.insert(0, base_pts)         # the untuned model on each seed's split
         xs = [float(np.mean([p['samples'] for p in row])) for row in pts]
         accs = [np.array([p['accuracy'] for p in row]) for row in pts]
         out[cond] = dict(samples=xs, mean=[float(a.mean()) for a in accs],
                          sem=[float(a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else 0.0
                               for a in accs], n_seeds=len(curves))
-    return out, (base['accuracy'] if base is not None else None)
+    base_acc = float(np.mean([p['accuracy'] for p in base_pts])) if base_pts else None
+    return out, base_acc
 
 
 def plot_accuracy_curve(results, name='exploretom_curve', subdir=''):
@@ -671,18 +670,13 @@ def _default_devices():
     return ['cpu']
 
 
-def run_one_dataset(dcfg, conditions, args, devices, mcfg, tcfg, trcfg):
-    """
-    Train and evaluate every unit for one dataset, write its two figures
-    (`exploretom_accuracy_<tag>`, `exploretom_curve_<tag>`, the tag carrying a
-    `_gen-...` suffix for the generated set) and print its tables. Returns the
-    list of failed unit-results (empty on full success).
-    """
+def _n_rows_for(dcfg, conditions, args, trcfg, devices):
+    """The training-row count per condition for one train/test split (`dcfg`).
+    The exact conditions train on the first `n_train` rows of the split's pool
+    (all of it if smaller), pinning their sample budget to that actual count so
+    `--n-train` is honoured (at 1,500 this is a no-op)."""
     n_rows = {}
     n_pool = len(train_pool(dcfg))
-    # the exact conditions train on the first `n_train` rows of the pool (all of
-    # it if smaller); pin their sample budget to that actual count so `--n-train`
-    # is honoured (at 1,500 this is a no-op).
     n_train_actual = min(n_pool, dcfg.n_train)
     if n_pool < dcfg.n_train:
         print(f'WARNING: the training pool holds {n_pool} rows, fewer than the {dcfg.n_train} '
@@ -700,8 +694,19 @@ def run_one_dataset(dcfg, conditions, args, devices, mcfg, tcfg, trcfg):
                                                   thinking=args.thinking)
         except ValueError as e:                       # a corrupt record: data changed?
             sys.exit(f'ERROR: {e}')
-    setup = Setup(mcfg, tcfg, n_rows)
+    return n_rows
 
+
+def run_one_dataset(dcfg, conditions, args, devices, mcfg, tcfg, trcfg):
+    """
+    Run the whole experiment for one dataset over `args.seeds` independent
+    train/test splits (each seed k uses `dcfg.seed = k` for the split and k as
+    the training seed; the base model is re-evaluated on each split), then
+    average over the seeds and write the two figures (`exploretom_accuracy_<tag>`,
+    `exploretom_curve_<tag>`, the tag carrying a `_gen-...` suffix for the
+    generated set) with SEM error bars/bands over the seeds. Returns the list of
+    failed unit-results (empty on full success).
+    """
     model_tag = args.base_model.split('/')[-1].lower()
     tag = model_tag + (f'_{teacher_tag(args.teacher)}' if 'distill' in conditions else '')
     if dcfg.dataset == 'generated':
@@ -710,29 +715,41 @@ def run_one_dataset(dcfg, conditions, args, devices, mcfg, tcfg, trcfg):
         tag += f'_fs{trcfg.focus_stride}'
     if trcfg.focus_beliefs != FOCUS_BELIEFS:
         tag += f'_f{trcfg.focus_beliefs[:3]}'
-    units = unit_list(args.seeds, conditions)
     lead = f'[{dcfg.dataset}] '
 
-    if args.plot_only:
-        results = load_cached(units, dcfg, trcfg, setup)
-        if not results:
-            print(f'{lead}no cached results; nothing to plot')
-            return []
-    else:
-        print_plan(units, dcfg, trcfg, devices, args.force, setup)
-        t0 = time.time()
-        results = run_all(units, dcfg, trcfg, devices, args.force, setup)
-        print(f'\n{lead}wall clock: {(time.time() - t0) / 60:.1f} min')
+    all_results = []
+    for k in range(args.seeds):
+        dcfg_k = replace(dcfg, seed=k)
+        if args.seeds > 1:
+            print(f'\n{lead}===== seed {k + 1}/{args.seeds} (train/test split seed {k}) =====',
+                  flush=True)
+        setup = Setup(mcfg, tcfg, _n_rows_for(dcfg_k, conditions, args, trcfg, devices))
+        # every condition, base included, evaluated on THIS split
+        units = [(c, k) for c in CONDITIONS if c in conditions]
+        if args.plot_only:
+            res = load_cached(units, dcfg_k, trcfg, setup)
+        else:
+            print_plan(units, dcfg_k, trcfg, devices, args.force, setup)
+            t0 = time.time()
+            res = run_all(units, dcfg_k, trcfg, devices, args.force, setup)
+            print(f'\n{lead}seed {k} wall clock: {(time.time() - t0) / 60:.1f} min')
+        for r in res:                       # stamp the split seed (base reports None)
+            if r is not None:
+                r['seed'] = k
+        all_results += res
 
-    failed = [r for r in results if r is not None and 'error' in r]
-    results = [r for r in results if r is not None and 'error' not in r]
+    if not all_results:
+        print(f'{lead}no cached results; nothing to plot')
+        return []
+    failed = [r for r in all_results if r is not None and 'error' in r]
+    results = [r for r in all_results if r is not None and 'error' not in r]
     path = plot_accuracy_bars(results, name=f'exploretom_accuracy_{tag}')
     if path:
-        print(f'\n{lead}wrote {path}.pdf/.png')
+        print(f'\n{lead}wrote {path}.pdf/.png  (mean over {args.seeds} seeds, SEM error bars)')
     path = plot_accuracy_curve(results, name=f'exploretom_curve_{tag}')
     if path:
         print(f'{lead}wrote {path}.pdf/.png')
-    print_summary(results, trcfg, setup.mcfg)
+    print_summary(results, trcfg, mcfg)
     print_curve(results)
     return failed
 

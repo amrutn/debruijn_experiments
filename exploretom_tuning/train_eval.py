@@ -128,7 +128,7 @@ class TrainConfig:
     # The budget is total samples consumed: the pool is reshuffled each time it
     # is exhausted, so `n_rows x passes` samples is `passes` epochs. Set per run
     # by `run_experiments.train_cfg`.
-    total_samples: int = 6000       # 1,500 rows x 4 passes
+    total_samples: int = 4500       # 1,500 rows x 3 passes
     schedule: str = 'cosine'        # annealed over this run's own horizon
     batch_size: int = 8
     grad_accum: int = 4             # effective batch 32

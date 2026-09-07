@@ -114,21 +114,27 @@ The sample does not include the per-step states, so they are recovered:
 
 ## 4. Splits
 
-`DataConfig(n_train=1500, n_test=200, q_per_story=4, seed=0)`, `_split`:
-the kept stories are put in a seeded order; from each story at most 4
-questions are chosen (seeded). The first stories supply the **test set**
-until 200 questions are taken; every later story supplies the **training
-pool** in order, and the training rows are the pool's first 1,500. Test and
-training stories are disjoint.
+`DataConfig(n_train=1500, n_test=250, q_per_story=4)`, `_split`: the kept
+stories are put in an order seeded by `dcfg.seed`; from each story at most 4
+questions are chosen (seeded). The first stories supply the **test set** until
+250 questions are taken (whole stories, so a little over 250); every later
+story supplies the **training pool** in order, and the training rows are the
+pool's first 1,500. Test and training stories are disjoint.
+
+The experiment is run over **five seeds** (`SEEDS`, `dcfg.seed = 0..4`), each a
+different train/test split of the same story pool (and a different training
+seed); results are averaged and the error bars are the SEM over the seeds
+(§7). The table below is one representative split (seed 0).
 
 | Split | Questions | Stories | Question types (reasoning order suffix; `*` = false belief) |
 |---|---|---|---|
-| test | 200 | 50 | knowledge-2 87 (21\*), knowledge-1 44, room-2 27 (2\*), container-1 15 (1\*), container-2 13 (1\*), memory 8, ground_truth 6 |
-| train | 1,500 (pool 1,792) | 375 | knowledge-2 530 (140\*), room-2 314 (7\*), knowledge-1 298, container-2 124 (26\*), container-1 103 (16\*), ground_truth 69, memory 62 |
+| test | 252 | 63 | knowledge-2 110 (29\*), knowledge-1 54, room-2 36 (2\*), container-1 19 (2\*), container-2 16 (1\*), memory 9, ground_truth 8 |
+| train | 1,500 (pool 1,740) | 375 | knowledge-2 521 (137\*), room-2 314 (8\*), knowledge-1 301, container-2 125 (28\*), container-1 104 (15\*), ground_truth 72, memory 63 |
 
-Test rows by people: 2 → 72, 3 → 56, 4 → 72; by rooms: 1 → 144, 2 → 56.
-Answers: yes/no, "knows about it" / "does not know about it", or a container,
-room or object name. Stories average 7.3 steps and 78 words (max 178).
+Test rows (seed 0) by people: 2 → 100, 3 → 68, 4 → 84; by rooms: 1 → 176,
+2 → 76. Answers: yes/no, "knows about it" / "does not know about it", or a
+container, room or object name. Stories average 7.2 steps and 77 words (max
+178, 15 steps).
 
 ## 5. Prompt, targets and grading
 
@@ -183,9 +189,9 @@ is dropped at build time.
 
 **Token counts** (Qwen tokenizer, training rows, stride 1, released sample):
 prompt mean 206 (max 337); direct target mean 5; chain mean 46 (max 154);
-state-tracking (explicit) mean 351 (max 1,454; prompt + target max 1,781);
+state-tracking (explicit) mean 349 (max 1,454; prompt + target max 1,781);
 narration mean 240 (max 515). Narration restates the whole story with a
-per-step line, so it is the same order of magnitude as state-tracking (~0.68×
+per-step line, so it is the same order of magnitude as state-tracking (~0.69×
 on the sample) and far longer than chain or direct, while carrying no running
 state. On the larger generated stories (6 people / 12 moves) the state-tracking
 trace averages ~1.0-1.3k tokens and narration ~0.7-0.9k (~0.79×), the operating
@@ -265,11 +271,11 @@ builds the file itself when it is short.
 | Adapter | LoRA r = 32, α = 64, dropout 0.05, on q/k/v/o/gate/up/down projections of every layer (~36.9M trainable, 2.4%) | `ModelConfig` |
 | Loss | next-token cross-entropy on the assistant tokens only (prompt masked with −100); the `<\|im_end\|>` closing the turn is a target | `train_eval.encode_example` |
 | Optimiser | AdamW, lr 1e-4, weight decay 0, β defaults, grad-norm clip 1.0 | `TrainConfig` |
-| Schedule | cosine to 0 over the run, 3% linear warm-up | `TrainConfig` |
+| Schedule | cosine decay to 0 over the run's 141 optimizer steps after a 3% linear warm-up (~4 steps); `get_scheduler('cosine', …)`, stepped every optimizer step and checkpointed/resumed | `TrainConfig.schedule`, `warmup_frac` |
 | Batch | 8 sequences × 4 accumulation = 32 per optimizer step | `TrainConfig` |
-| Budget | 4 passes over the 1,500 rows = 6,000 samples, 188 optimizer steps; reshuffled each pass | `run_experiments.PASSES`, `train_cfg` |
+| Budget | 3 passes over the 1,500 rows = 4,500 samples, 141 optimizer steps; reshuffled each pass | `run_experiments.PASSES`, `train_cfg` |
 | Max sequence | 4,096 tokens (no training example exceeds it) | `TrainConfig.max_seq_len` |
-| Seed | 0 (LoRA init and sample order); one seed per condition | `run_experiments.SEEDS` |
+| Seeds | 5 replicates; each seed k is a different train/test split (`dcfg.seed = k`) **and** training seed (LoRA init + sample order). Results averaged, error bars SEM over the seeds; base re-evaluated per split | `run_experiments.SEEDS` |
 | Gradient checkpointing | on | `train_adapter` |
 
 ## 7. Evaluation
@@ -278,10 +284,13 @@ Greedy decoding (`EvalConfig.do_sample=False`), up to 2,048 new tokens,
 stopping at `<|im_end|>` / EOS, batched left-padded with prompts sorted
 longest first (batch 64; the batch size is not part of any cache key, and
 greedy decoding is batch-invariant). A reply that hits the cap is scored
-wrong and counted in `capped`. Reported per condition: accuracy over the 200
-rows (binomial SEM), *story accuracy* (test stories with all their questions
-right), `answered`, `capped`, mean generated tokens, accuracy per question
-type and for false-belief versus true-belief/factual questions.
+wrong and counted in `capped`. Each of the five seeds is scored on its own
+~250-row test split; the reported number per condition is the **mean over the
+five seeds** and its error bar is the **SEM over the seeds** (with one seed it
+falls back to the binomial SEM over the test rows). Also reported: *story
+accuracy* (test stories with all their questions right), `answered`, `capped`,
+mean generated tokens, and accuracy per question type and for false-belief
+versus true-belief/factual questions (from the first seed).
 
 **Learning curve.** While an adapter trains it is evaluated
 `TrainConfig.curve_evals = 20` times, evenly spaced over the optimizer steps
@@ -335,10 +344,11 @@ kernel on a machine and reports which train cleanly.
 Python ≥ 3.10, `torch`, `transformers` (5.x; tested with 5.16), `peft`
 (0.20), `tqdm`, `numpy`, `matplotlib`; `anthropic` (1.x) only for an API
 teacher. The tracker needs only the standard library. The default runs both
-datasets — about ten units (two × [1 base + 4 conditions]) with twenty curve
-evaluations each — which is several hours on one GPU (H100/B200 class);
-`--dataset sample` or `--dataset generated` runs a single dataset. A CPU smoke
-test (`--n-train 8 --n-test 8 --q-per-story 2` with a small model) exercises
+datasets over five seeds — about fifty units (2 datasets × 5 seeds × [1 base +
+4 conditions]) with twenty curve evaluations each — the better part of a day on
+one GPU (H100/B200 class); everything caches and resumes, and `--dataset
+sample`/`--dataset generated` and `--seeds N` cut it down. A CPU smoke test
+(`--n-train 8 --n-test 8 --q-per-story 2 --seeds 1` with a small model) exercises
 every path.
 
 ## 11. Commands
@@ -347,7 +357,7 @@ every path.
 cd exploretom_tuning
 python exploretom_data.py --show 2                 # build + verify the problem set, print examples
 python check_train.py --device cuda:0              # optional kernel check
-python run_experiments.py --devices cuda:0         # BOTH datasets (generated + sample), default conditions
+python run_experiments.py --devices cuda:0         # BOTH datasets x 5 seeds, default conditions (the full run)
 python run_experiments.py --devices cuda:0 --dataset sample     # only the released-sample baseline
 python run_experiments.py --devices cuda:0 --conditions base,direct,chain,state_tracking,narration,distill
 python generate_stories.py --people 6 --moves 12 --stories 20 --show 1           # preview generated stories
@@ -361,6 +371,13 @@ The stride and the belief mode are part of the adapter cache keys, and
 figures made with non-default settings carry a `_fs<n>` suffix.
 
 ## 13. Run record
+
+These runs predate the current defaults and are kept as a development log:
+they used a single seed, 200 test rows, 3 training passes and 10 curve
+evaluations, and the earlier condition names (`focused` = state-tracking; the
+removed `ledger`/`segment`). The current setup (§4–§8) is five seeds over
+different splits, 250 test rows, 3 passes, 20 curve evaluations, both datasets,
+with SEM over the seeds; re-running reproduces these trends with error bars.
 
 **Run 1 (2026-09-06; both ledgers at stride 2, focused beliefs as
 departures; everything else as above).** Test accuracy over the 200 rows,
