@@ -36,7 +36,7 @@ distill         optional (``--conditions ...,distill``): a LoRA trained on a
 The chain, state_tracking and narration targets are computed from the
 replayed story, so the exact conditions are trained on identical rows with
 identical labels and differ in the format of the reasoning only. Training is LoRA r=32 on every
-projection, lr 1e-4 cosine, effective batch 32, over three passes of the rows,
+projection, lr 1e-4 cosine, effective batch 32, over four passes of the rows,
 one seed. While an adapter trains it is scored twenty times on the test set
 (`TrainConfig.curve_evals`), which gives the learning curve.
 
@@ -137,7 +137,7 @@ DATA = DataConfig(n_train=1500, n_test=200, q_per_story=4, seed=0)
 # larger GPUs too, so the loss is averaged exactly as in the math task.
 MODEL = ModelConfig()
 TRAIN = TrainConfig(lr=1e-4, batch_size=8, grad_accum=4)
-PASSES = 3                      # sweeps over the training rows per adapter (epochs)
+PASSES = 4                      # sweeps over the training rows per adapter (epochs)
 
 # Greedy, batch 64: the 1.5B model's KV cache is small (2 KV heads, ~28 KB per
 # token), so 64 sequences of ~2.3k tokens use ~4 GB; `run_unit` halves the
@@ -203,12 +203,11 @@ LEGEND_FS = 7
 LINE_LW = 1.8
 BAND_ALPHA = 0.3
 
-# A distinct, publication-friendly colour per line: the untuned model is grey
-# and each fine-tuned condition gets a well-separated hue (blue / orange / red /
-# magenta / green), so no two lines read alike -- in particular narration is a
-# magenta well away from direct's blue.
+# A distinct, publication-friendly colour per line: the untuned model is grey,
+# the hero state-tracking condition is black, and the others take well-separated
+# hues (direct blue, chain orange, narration red, distill green).
 COND_COLOR = {'base': '#8c8c8c', 'direct': '#4c72b0', 'chain': '#dd8452',
-              'state_tracking': '#c44e52', 'narration': '#d6489b', 'distill': '#55a868'}
+              'state_tracking': '#000000', 'narration': '#c44e52', 'distill': '#55a868'}
 
 
 def _apply_style():

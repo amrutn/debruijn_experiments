@@ -267,7 +267,7 @@ builds the file itself when it is short.
 | Optimiser | AdamW, lr 1e-4, weight decay 0, β defaults, grad-norm clip 1.0 | `TrainConfig` |
 | Schedule | cosine to 0 over the run, 3% linear warm-up | `TrainConfig` |
 | Batch | 8 sequences × 4 accumulation = 32 per optimizer step | `TrainConfig` |
-| Budget | 3 passes over the 1,500 rows = 4,500 samples, 141 optimizer steps; reshuffled each pass | `run_experiments.PASSES`, `train_cfg` |
+| Budget | 4 passes over the 1,500 rows = 6,000 samples, 188 optimizer steps; reshuffled each pass | `run_experiments.PASSES`, `train_cfg` |
 | Max sequence | 4,096 tokens (no training example exceeds it) | `TrainConfig.max_seq_len` |
 | Seed | 0 (LoRA init and sample order); one seed per condition | `run_experiments.SEEDS` |
 | Gradient checkpointing | on | `train_adapter` |
