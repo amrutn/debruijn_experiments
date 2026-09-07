@@ -1,71 +1,104 @@
 """
-Fine-tune Qwen2.5-1.5B-Instruct on GSM8K reasoning traces and score it on the
-GSM8K test set.
+Fine-tune Qwen2.5-1.5B-Instruct on ExploreToM training targets and score it
+on the ExploreToM test rows.
 
-Three adapters are trained on the same 1,500 training problems -- on the
-standard traces, on the restated traces (`gsm8k_data`) and on a larger
-model's solutions (`distill`) -- and evaluated alongside the untuned base
-model. Training is LoRA on top of the frozen base model with the math task's
-settings: a full fine-tune of a 1.5B model needs ~25 GB for weights +
-gradients + AdamW state, whereas LoRA produces ~40 MB adapters that are cheap
-to cache and fits any current GPU.
+Adapters are trained on the same 1,500 training questions -- on the answer
+alone (direct), on the question-specific chain of decisive steps (chain), on
+the story restated with the question's slice of the state after each step
+(state_tracking, the local De Bruijn trace), on the story restated with a
+local per-step note that carries no running state (narration, the length-
+matched non-De-Bruijn control; `exploretom_data`), optionally on a teacher's
+reasoning (distill; `traces`) -- and evaluated alongside the untuned base
+model. Training is LoRA on top
+of the frozen base model with the math task's settings: a full fine-tune of
+a 1.5B model needs ~25 GB for weights + gradients + AdamW state, whereas
+LoRA produces ~40 MB adapters that are cheap to cache and fits any current
+GPU.
 
 Loss is next-token cross-entropy on the *assistant* tokens only -- the chat
-template's system/user turns are context and are never scored -- exactly as in
-the math task.
+template's system/user turns are context and are never scored.
 
 Evaluation
 ----------
 Ordinary batched greedy decoding of the chat prompt, up to `max_new_tokens`
-new tokens, scored by `gsm8k_data.is_correct` on the number after ``####``. A
-trace that hits the cap without answering is scored wrong; the fraction that
-did so is reported as `capped` so a low accuracy can be read correctly.
+new tokens, scored by `exploretom_data.is_correct` on the normalised text of
+the answer field. A completion that hits the cap without answering is scored
+wrong; the fraction that did so is reported as `capped`, and the fraction
+that wrote an answer field as `answered`. Alongside plain accuracy a
+*story-level* accuracy is reported: the fraction of test stories whose
+every question is answered correctly.
+
+Learning curve
+--------------
+While an adapter trains it is scored `TrainConfig.curve_evals` times, at
+evenly spaced optimizer steps (the last at the end of training), on the very
+test set and decoding settings of the final evaluation, so the last curve
+point and the final score coincide. The curve is stored with the adapter.
 
 Caching
 -------
 Three layers under ``cache/``: ``adapters/`` (a trained LoRA per (condition,
-seed), keyed by the full training config), ``decodes/`` (the test-set
-completions per model, keyed additionally by the decoding config) and
-``evals/`` (the score). An eval-only change reuses the adapter and a rescoring
-reuses the decode, so a rerun recomputes only what is missing.
+seed), keyed by the full training config and the target spec), ``decodes/``
+(the test-set completions per model, keyed additionally by the decoding
+config) and ``evals/`` (the score). An eval-only change reuses the adapter
+and a rescoring reuses the decode, so a rerun recomputes only what is
+missing.
 
 Progress is also saved *within* a unit, so an interruption costs minutes, not
 the unit: training writes a resumable checkpoint (adapter, optimizer,
-schedule, RNG state and counters) every `CKPT_EVERY_STEPS` optimizer steps
-and continues from it on the next run, and decoding appends every finished
-batch to a partial file that the next run reads back before decoding the
-rest. Both are removed once the final artefact is written.
+schedule, RNG state, counters and the curve so far) every `CKPT_EVERY_STEPS`
+optimizer steps and continues from it on the next run, and decoding appends
+every finished batch to a partial file that the next run reads back before
+decoding the rest. Both are removed once the final artefact is written.
+
+Numerical safety
+----------------
+A non-finite loss or gradient norm aborts the unit at once (nothing is
+saved), because one such step poisons the adapter through AdamW and the
+finished adapter would be junk after a long evaluation. Which attention
+kernels training may use is a setting (`TrainConfig.sdpa_backends`,
+`ModelConfig.attn_implementation`); `check_train.py` tries each kernel on a
+machine and says which train cleanly.
 """
 
 import os
 import json
+import math
 import time
 import random
 import shutil
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 
 import torch
 from tqdm.auto import tqdm
 
-from gsm8k_data import (
-    DataConfig, get_problems, standard_trace, is_correct, extract_answer,
-    train_spec, test_spec, _key, CACHE, SYSTEM_PROMPT, ANSWER_MARKER,
+from exploretom_data import (
+    get_problems, is_correct, extract_answer, user_message,
+    train_spec, test_spec, _key, CACHE, SYSTEM_PROMPT,
 )
-from traces import TraceConfig, trace_spec, load_traces
-from distill import distill_spec, load_distill_traces
+from traces import target_spec, training_examples
 
 ADAPTER_CACHE = os.path.join(CACHE, 'adapters')
 EVAL_CACHE = os.path.join(CACHE, 'evals')
 DECODE_CACHE = os.path.join(CACHE, 'decodes')
 
+# The base models and the Hub commits the results are reported for.
+BASE_MODELS = {
+    'Qwen/Qwen2.5-1.5B-Instruct': '989aa7980e4cf806f80c7fef2b1adb7bc71aa306',
+    'Qwen/Qwen2.5-1.5B': '8faed761d45a263340a0528343f099c05c9a4323',
+}
 BASE_MODEL = 'Qwen/Qwen2.5-1.5B-Instruct'
-# The Hub commit of the base model the results are reported for.
-BASE_REVISION = '989aa7980e4cf806f80c7fef2b1adb7bc71aa306'
+BASE_REVISION = BASE_MODELS[BASE_MODEL]
 
-# 'base' is the untuned model; the others are adapters trained on that trace
-# source. The order is the order of the figure and of the run queue, so the
-# distillation units come after everything else.
-CONDITIONS = ('base', 'standard', 'restated', 'distill')
+# 'base' is the untuned model; the others are adapters trained on that target.
+# The order is the order of the figure and of the run queue; 'distill' needs
+# teacher traces and is not run unless asked for.
+# 'state_tracking' is the local, De Bruijn-structured reasoning trace (the
+# story restated with the question's running world-and-belief state after each
+# step); shown as "state-tracking". 'distill' needs teacher traces and is not
+# run unless asked for.
+CONDITIONS = ('base', 'direct', 'chain', 'state_tracking', 'narration', 'distill')
+DEFAULT_CONDITIONS = ('base', 'direct', 'chain', 'state_tracking', 'narration')
 
 
 # ----------------------------------------------------------------------------
@@ -77,8 +110,11 @@ class ModelConfig:
     """Base model + LoRA adapter shape."""
     base_model: str = BASE_MODEL
     base_revision: str = BASE_REVISION      # None: whatever the Hub serves
-    lora_r: int = 16
-    lora_alpha: int = 32
+    # 'sdpa' (torch's fused attention) or 'eager'; `check_train.py` says which
+    # kernels train cleanly on a given machine.
+    attn_implementation: str = 'sdpa'
+    lora_r: int = 32
+    lora_alpha: int = 64
     lora_dropout: float = 0.05
     target_modules: tuple = ('q_proj', 'k_proj', 'v_proj', 'o_proj',
                              'gate_proj', 'up_proj', 'down_proj')
@@ -89,34 +125,46 @@ class TrainConfig:
     """Optimisation settings for the LoRA fine-tune (the math task's)."""
     lr: float = 1e-4
     weight_decay: float = 0.0
-    # The budget is total samples consumed, as in the math task: the pool is
-    # reshuffled each time it is exhausted, so `n_train x passes` samples is
-    # `passes` epochs. Set per run by `run_experiments.train_cfg`.
-    total_samples: int = 4500       # 1,500 problems x 3 passes
+    # The budget is total samples consumed: the pool is reshuffled each time it
+    # is exhausted, so `n_rows x passes` samples is `passes` epochs. Set per run
+    # by `run_experiments.train_cfg`.
+    total_samples: int = 4500       # 1,500 rows x 3 passes
     schedule: str = 'cosine'        # annealed over this run's own horizon
     batch_size: int = 8
     grad_accum: int = 4             # effective batch 32
     warmup_frac: float = 0.03
     grad_clip: float = 1.0
-    # A standard example is ~195 tokens with the Qwen2.5 tokenizer and never
-    # exceeds 470; the hand-written ledger examples average ~330 and top out
-    # at 880; the default teacher's examples match the standard ones. Nothing
-    # is truncated at 1,024; an example that would not fit is dropped and the
-    # count is logged. (The math task used 896; its traces are shorter.) The
-    # thinking-trace teacher overrides this per condition (`distill.budget`).
-    max_seq_len: int = 1024
+    # A story is at most ~180 words and a ledger target restates it with a
+    # state line every two steps: the longest ledger examples are ~1,200
+    # words, about 1,700 tokens with the prompt (2,900 at stride 1). Nothing
+    # is truncated at 4,096; an example that would not fit is dropped and the
+    # count is logged.
+    max_seq_len: int = 4096
     seed: int = 0
     dtype: str = 'bfloat16'
+    # Learning curve: `curve_evals` evaluations spread evenly over the optimizer
+    # steps (the last one at the end of training), each a decode of the run's
+    # test set under the run's EvalConfig. 0 disables the curve. This is part of
+    # the adapter cache key (the curve is produced during training), so changing
+    # it retrains the adapters.
+    curve_evals: int = 20
+    # The kernels torch's fused attention may use during training, a
+    # comma-separated subset of `SDPA_BACKENDS` ('' = torch's own choice).
+    # cuDNN's kernel is left out: on Hopper/Blackwell GPUs it has returned
+    # non-finite gradients in bf16 for padded batches in several torch
+    # releases while its forward pass is fine (every adapter of a GSM8K run
+    # went NaN that way, the base model fine). The other kernels are as fast
+    # for a 1.5B model. `check_train.py` tests each kernel on a machine.
+    sdpa_backends: str = 'flash,efficient,math'
 
 
 @dataclass
 class EvalConfig:
     """Decoding settings for evaluation."""
-    # Standard ground-truth traces are at most ~340 assistant tokens, the
-    # hand-written ledger traces at most ~740 (rule-based ones reach ~1,400).
-    # 1,024 leaves the tail room without letting a runaway trace hold the
-    # batch for long. The thinking-trace teacher overrides it (`distill.budget`).
-    max_new_tokens: int = 1024
+    # A ledger reply for the longest test story is ~1,550 tokens (training
+    # ledgers reach ~2,550); 2,048 leaves room without letting a runaway reply
+    # hold the batch for long.
+    max_new_tokens: int = 2048
     # Runtime only: not part of any cache key (greedy decoding is
     # batch-invariant) and halved on OOM by `run_unit`.
     batch_size: int = 64
@@ -126,6 +174,35 @@ class EvalConfig:
     temperature: float = 0.6
     top_p: float = 0.8
     eval_seed: int = 0
+
+
+SDPA_BACKENDS = ('math', 'efficient', 'flash', 'cudnn')
+
+
+def sdpa_context(names):
+    """
+    A context that restricts torch's scaled-dot-product attention to the
+    kernels in `names` (a list or comma-separated string of `SDPA_BACKENDS`),
+    or does nothing when `names` is empty.
+    """
+    import contextlib
+    if isinstance(names, str):
+        names = [n.strip() for n in names.split(',') if n.strip()]
+    if not names:
+        return contextlib.nullcontext()
+    unknown = [n for n in names if n not in SDPA_BACKENDS]
+    if unknown:
+        raise ValueError(f'unknown sdpa backend(s) {unknown}; choose from {SDPA_BACKENDS}')
+    try:
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+    except ImportError:                              # torch < 2.3: no per-kernel control
+        return contextlib.nullcontext()
+    table = {'math': 'MATH', 'efficient': 'EFFICIENT_ATTENTION',
+             'flash': 'FLASH_ATTENTION', 'cudnn': 'CUDNN_ATTENTION'}
+    backends = [getattr(SDPBackend, table[n]) for n in names if hasattr(SDPBackend, table[n])]
+    if not backends:
+        raise ValueError(f'none of the sdpa backends {names} exist in torch {torch.__version__}')
+    return sdpa_kernel(backends)
 
 
 def eval_spec(ecfg):
@@ -139,21 +216,16 @@ def eval_spec(ecfg):
 def model_spec(cond, dcfg, mcfg, tcfg, trcfg):
     """
     What identifies a model under evaluation: for the base condition the base
-    model alone; for a fine-tuned one the training subset, adapter shape and
-    optimisation settings, plus -- for the restated and distillation
-    conditions -- the trace set. The test split is deliberately absent, so an
-    adapter is shared by every evaluation of it.
+    model alone; for a fine-tuned one the training rows, adapter shape,
+    optimisation settings and the condition's target spec (`traces.target_spec`).
+    The test split is deliberately absent, so an adapter is shared by every
+    evaluation of it.
     """
     if cond == 'base':
-        return dict(task='gsm8k', cond='base', base_model=mcfg.base_model,
+        return dict(task='exploretom', cond='base', base_model=mcfg.base_model,
                     base_revision=mcfg.base_revision)
-    spec = dict(task='gsm8k', cond=cond, data=train_spec(dcfg), model=asdict(mcfg),
-                train=asdict(tcfg))
-    if cond == 'restated':
-        spec['traces'] = trace_spec(trcfg, dcfg)
-    elif cond == 'distill':
-        spec['traces'] = distill_spec(trcfg, dcfg)
-    return spec
+    return dict(task='exploretom', cond=cond, data=train_spec(dcfg), model=asdict(mcfg),
+                train=asdict(tcfg), targets=target_spec(cond, trcfg, dcfg))
 
 
 # ----------------------------------------------------------------------------
@@ -163,14 +235,14 @@ def model_spec(cond, dcfg, mcfg, tcfg, trcfg):
 def chat_prefix(tokenizer, problem):
     """The templated system+user turns plus the assistant generation header."""
     msgs = [{'role': 'system', 'content': SYSTEM_PROMPT},
-            {'role': 'user', 'content': problem.question.strip()}]
+            {'role': 'user', 'content': user_message(problem)}]
     return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
 
-def encode_example(tokenizer, problem, trace, max_seq_len):
+def encode_example(tokenizer, problem, target, max_seq_len):
     """
-    One training example: chat-templated prompt + trace, with the prompt tokens
-    masked out of the loss.
+    One training example: chat-templated prompt + target, with the prompt
+    tokens masked out of the loss.
 
     Returns
     -------
@@ -179,7 +251,7 @@ def encode_example(tokenizer, problem, trace, max_seq_len):
     """
     prefix_ids = tokenizer(chat_prefix(tokenizer, problem), add_special_tokens=False)['input_ids']
     # the assistant turn must be closed so the model learns to stop
-    reply_ids = tokenizer(trace + '<|im_end|>', add_special_tokens=False)['input_ids']
+    reply_ids = tokenizer(target + '<|im_end|>', add_special_tokens=False)['input_ids']
     ids = prefix_ids + reply_ids
     if len(ids) > max_seq_len:
         return None
@@ -199,23 +271,9 @@ def collate(batch, pad_id):
     return (torch.tensor(input_ids), torch.tensor(labels), torch.tensor(attn))
 
 
-def training_text(cond, problem, traces):
-    """The assistant-side text a condition trains on for `problem`."""
-    if cond == 'standard':
-        return standard_trace(problem)
-    if cond in ('restated', 'distill'):
-        return traces[problem.idx]
-    raise ValueError(f'condition {cond!r} is not trained')
-
-
-def load_training_traces(cond, dcfg, trcfg):
-    """The ``{idx: text}`` a condition trains on, validated, or None for the
-    standard condition (which reads the ground truth directly)."""
-    if cond == 'restated':
-        return load_traces(trcfg, dcfg)
-    if cond == 'distill':
-        return load_distill_traces(trcfg, dcfg)
-    return None
+def training_pool(cond, dcfg, trcfg):
+    """The ``[(problem, target)]`` a condition trains on (`traces.training_examples`)."""
+    return training_examples(cond, dcfg, trcfg)
 
 
 # ----------------------------------------------------------------------------
@@ -243,33 +301,41 @@ def adapter_is_cached(cond, dcfg, mcfg, tcfg, trcfg):
                                        ADAPTER_DONE))
 
 
-def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, device='cuda', force=False,
+def adapter_curve(cond, dcfg, mcfg, tcfg, trcfg, ecfg):
+    """
+    The learning curve recorded while the adapter was trained -- a list of
+    ``{'step', 'samples', 'accuracy', 'robust', 'answered', 'capped',
+    'mean_tokens', 'n_eval'}`` in training order -- provided it was recorded
+    on the test set of `dcfg` under `ecfg`; else None.
+    """
+    path = os.path.join(_adapter_path(cond, dcfg, mcfg, tcfg, trcfg), ADAPTER_DONE)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        meta = json.load(f)
+    if meta.get('curve_test') != test_spec(dcfg) or meta.get('curve_eval') != eval_spec(ecfg):
+        return None
+    return meta.get('curve', [])
+
+
+def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, ecfg, device='cuda', force=False,
                   log=print, progress_pos=0):
     """
-    Fine-tune a LoRA for `cond` ('standard', 'restated' or 'distill'), or reuse
-    the cached one.
+    Fine-tune a LoRA for `cond` ('direct', 'chain', 'state_tracking' or
+    'distill'), or reuse the cached one.
 
     Training consumes `tcfg.total_samples` samples from the pool, reshuffling
     each time it is exhausted, under a cosine schedule over that budget. The
-    restated and distillation conditions read their traces through
-    `load_training_traces`, which validates them before anything is trained.
+    learning curve is scored on the test set of `dcfg` under `ecfg`.
 
     Every `CKPT_EVERY_STEPS` optimizer steps the adapter, optimizer, schedule,
-    RNG states and counters are checkpointed next to the final path, and a
-    run that finds such a checkpoint continues from it -- the same sample
-    order and schedule as the uninterrupted run, up to floating-point
+    RNG states, counters and curve are checkpointed next to the final path,
+    and a run that finds such a checkpoint continues from it -- the same
+    sample order and schedule as the uninterrupted run, up to floating-point
     nondeterminism. The finished adapter is written to a temporary directory
     and moved into place with a `done.json` marker as the completion signal,
     so an interrupted run cannot leave a half-written adapter behind; the
     checkpoint is then removed.
-
-    Params
-    ------
-    cond : str
-        'standard', 'restated' or 'distill'.
-    dcfg, mcfg, tcfg, trcfg : DataConfig, ModelConfig, TrainConfig, TraceConfig
-    force : bool
-        Retrain from scratch even if a cached adapter or a checkpoint exists.
 
     Returns
     -------
@@ -303,15 +369,16 @@ def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, device='cuda', force=False,
     random.seed(tcfg.seed)
     dtype = getattr(torch, tcfg.dtype)
 
-    traces = load_training_traces(cond, dcfg, trcfg)
-    problems = get_problems(dcfg, 'train')
+    examples = training_pool(cond, dcfg, trcfg)     # [(problem, given, target)]
+    n_rows_unique = len({p.idx for p, _ in examples})
 
     log(f'{tag} loading {mcfg.base_model} on {device} ...')
     tok = AutoTokenizer.from_pretrained(mcfg.base_model, revision=mcfg.base_revision)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(mcfg.base_model, revision=mcfg.base_revision,
-                                                 dtype=dtype)
+                                                 dtype=dtype,
+                                                 attn_implementation=mcfg.attn_implementation)
     model.to(device)
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
@@ -325,30 +392,36 @@ def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, device='cuda', force=False,
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
 
-    data, n_absent = [], 0
-    build = tqdm(problems, desc=f'{cond} s{tcfg.seed} build data', position=progress_pos,
+    data = []
+    build = tqdm(examples, desc=f'{cond} s{tcfg.seed} build data', position=progress_pos,
                  leave=False, dynamic_ncols=True, mininterval=2.0, unit='ex')
-    for prob in build:
-        if traces is not None and prob.idx not in traces:
-            n_absent += 1                                # dropped by the trace set's fill policy
-            continue
-        e = encode_example(tok, prob, training_text(cond, prob, traces), tcfg.max_seq_len)
+    over = []
+    for prob, target in build:
+        e = encode_example(tok, prob, target, tcfg.max_seq_len)
         if e is not None:
             data.append(e)
+        else:
+            over.append(len(tok(chat_prefix(tok, prob) + target,
+                                add_special_tokens=False)['input_ids']))
     build.close()
+    if not data:
+        raise RuntimeError(
+            f'{tag} no {cond} training example fits max_seq_len={tcfg.max_seq_len} '
+            f'({len(over)} examples, {min(over)}-{max(over)} tokens); this target is too long for '
+            f'these stories. Raise --max-seq-len or drop {cond} from --conditions.')
     lens = [len(e['input_ids']) for e in data]
     mean_tok = sum(lens) / max(len(lens), 1)
     reply_tok = sum(sum(l != -100 for l in e['labels']) for e in data) / max(len(data), 1)
     budget = int(tcfg.total_samples)
     eff_batch = tcfg.batch_size * tcfg.grad_accum
     opt_steps = (budget + eff_batch - 1) // eff_batch
-    n_too_long = len(problems) - n_absent - len(data)
+    n_too_long = len(examples) - len(data)
 
     log(f'{tag} LoRA {trainable/1e6:.1f}M trainable / {total/1e6:.0f}M total '
         f'({100 * trainable / total:.2f}%)')
-    log(f'{tag} pool {len(data)}/{len(problems)} examples ({n_too_long} over '
-        f'{tcfg.max_seq_len} tok dropped, {n_absent} without a trace) | mean {mean_tok:.0f} '
-        f'tok ({reply_tok:.0f} scored), max {max(lens) if lens else 0}')
+    log(f'{tag} pool {len(data)} rows from {n_rows_unique} ({n_too_long} over '
+        f'{tcfg.max_seq_len} tok dropped) | mean {mean_tok:.0f} tok ({reply_tok:.0f} scored), '
+        f'max {max(lens) if lens else 0}')
     log(f'{tag} streaming {budget:,} samples ({budget * mean_tok / 1e6:.2f}M tokens, '
         f'{opt_steps:,} optimizer steps, effective batch {eff_batch})')
 
@@ -357,6 +430,54 @@ def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, device='cuda', force=False,
     sched = get_scheduler(tcfg.schedule, opt,
                           num_warmup_steps=int(tcfg.warmup_frac * opt_steps),
                           num_training_steps=opt_steps)
+
+    # learning curve: which optimizer steps to evaluate at
+    curve = []
+    curve_steps = []
+    if tcfg.curve_evals > 0:
+        every = max(1, -(-opt_steps // tcfg.curve_evals))
+        curve_steps = sorted(set(range(every, opt_steps, every)) | {opt_steps})
+        curve_problems = get_problems(dcfg, 'test')
+        tok_gen = AutoTokenizer.from_pretrained(mcfg.base_model, revision=mcfg.base_revision)
+        if tok_gen.pad_token_id is None:
+            tok_gen.pad_token = tok_gen.eos_token
+        tok_gen.padding_side = 'left'
+        log(f'{tag} learning curve: {len(curve_steps)} evaluations on the {len(curve_problems)} '
+            f'test rows (<= {ecfg.max_new_tokens} new tokens) at steps {curve_steps}')
+
+    def curve_eval(step, n_samples):
+        """Score the adapter as it is now on the test set; RNG state is
+        restored so the evaluation leaves the training run unchanged."""
+        rng_state = torch.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state(device) if device.startswith('cuda') else None
+        model.eval()
+        model.config.use_cache = True
+        batch = ecfg.batch_size
+        while True:
+            try:
+                outputs = generate_answers(
+                    model, tok_gen, curve_problems, replace(ecfg, batch_size=batch),
+                    device=device, desc=f'{cond} s{tcfg.seed} curve @{step}',
+                    progress_pos=progress_pos)
+                break
+            except Exception as e:                  # noqa: BLE001 -- OOM retry
+                if _is_oom(e) and batch > 1:
+                    torch.cuda.empty_cache()
+                    batch = max(1, batch // 2)
+                    continue
+                raise
+        model.config.use_cache = False
+        model.train()
+        torch.set_rng_state(rng_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state(cuda_state, device)
+        s = score(curve_problems, outputs)
+        r = dict(step=step, samples=n_samples, **{k: s[k] for k in (
+            'accuracy', 'robust', 'answered', 'capped', 'mean_tokens', 'n_eval')})
+        curve.append(r)
+        log(f'{tag} curve @ step {step} ({n_samples:,} samples): acc={r["accuracy"]:.3f} '
+            f'story={r["robust"]:.3f} answered={r["answered"]:.3f} capped={r["capped"]:.3f} '
+            f'mean {r["mean_tokens"]:.0f} tok')
 
     rng = random.Random(tcfg.seed)
     order = list(range(len(data)))
@@ -374,6 +495,7 @@ def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, device='cuda', force=False,
         order, cursor = state['order'], state['cursor']
         consumed, micro, tok_seen = state['consumed'], state['micro'], state['tok_seen']
         running, elapsed = state['running'], state['elapsed']
+        curve = state.get('curve', [])
         torch.set_rng_state(state['torch_rng'])
         if device.startswith('cuda') and state.get('cuda_rng') is not None:
             torch.cuda.set_rng_state(state['cuda_rng'], device)
@@ -388,7 +510,8 @@ def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, device='cuda', force=False,
             json.dump(dict(cond=cond, seed=tcfg.seed, total_samples=n_samples,
                            final_loss=loss, seconds=secs, train_tokens=toks,
                            mean_tokens=mean_tok, reply_tokens=reply_tok,
-                           n_examples=len(data), n_too_long=n_too_long, n_absent=n_absent),
+                           n_examples=len(data), n_too_long=n_too_long, n_rows=n_rows_unique,
+                           curve=curve, curve_test=test_spec(dcfg), curve_eval=eval_spec(ecfg)),
                       f, indent=1)
         os.makedirs(ADAPTER_CACHE, exist_ok=True)
         shutil.rmtree(final_path, ignore_errors=True)
@@ -404,7 +527,7 @@ def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, device='cuda', force=False,
         torch.save(dict(opt=opt.state_dict(), sched=sched.state_dict(), rng=rng.getstate(),
                         order=order, cursor=cursor, consumed=consumed, micro=micro,
                         tok_seen=tok_seen, running=running[-40:], elapsed=time.time() - t0,
-                        torch_rng=torch.get_rng_state(),
+                        curve=curve, torch_rng=torch.get_rng_state(),
                         cuda_rng=(torch.cuda.get_rng_state(device)
                                   if device.startswith('cuda') else None),
                         n_data=len(data)),
@@ -414,9 +537,13 @@ def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, device='cuda', force=False,
 
     model.train()
     t0 = time.time() - elapsed
+    if tcfg.sdpa_backends:
+        log(f'{tag} attention restricted to the {tcfg.sdpa_backends} kernel(s) for training')
     bar = tqdm(total=budget, initial=consumed, desc=f'{cond} s{tcfg.seed} train',
                position=progress_pos, leave=True, dynamic_ncols=True, mininterval=2.0,
                unit='ex')
+    kernels = sdpa_context(tcfg.sdpa_backends)
+    kernels.__enter__()
     while consumed < budget:
         take = min(tcfg.batch_size, budget - consumed)
         if cursor + take > len(order):                  # exhausted: reshuffle
@@ -427,18 +554,34 @@ def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, device='cuda', force=False,
         ids, labels, attn = collate([data[i] for i in idx], tok.pad_token_id)
         out = model(input_ids=ids.to(device), attention_mask=attn.to(device),
                     labels=labels.to(device))
+        loss_val = float(out.loss.item())
+        if not math.isfinite(loss_val):
+            # Fail here, not after thousands of samples: a non-finite loss
+            # poisons the weights through AdamW, and the adapter would be junk.
+            raise RuntimeError(
+                f'{tag} non-finite loss ({loss_val}) at micro-batch {micro + 1}, sample '
+                f'{consumed + take:,}/{budget:,}, sequence lengths {sorted(ids.shape[1:])}; '
+                f'nothing saved. Run `python check_train.py` on this GPU to isolate the cause.')
         (out.loss / tcfg.grad_accum).backward()
-        running.append(float(out.loss.item()))
+        running.append(loss_val)
         tok_seen += int(attn.sum())
         consumed += take
         micro += 1
         if micro % tcfg.grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(
+            gnorm = torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], tcfg.grad_clip)
+            if not torch.isfinite(gnorm):
+                raise RuntimeError(
+                    f'{tag} non-finite gradient norm at optimizer step {micro // tcfg.grad_accum} '
+                    f'(loss {loss_val:.4f} was finite); nothing saved. Run `python check_train.py` '
+                    'on this GPU to isolate the cause.')
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
-            if (micro // tcfg.grad_accum) % CKPT_EVERY_STEPS == 0 and consumed < budget:
+            step = micro // tcfg.grad_accum
+            if step in curve_steps and not any(c['step'] == step for c in curve):
+                curve_eval(step, consumed)
+            if step % CKPT_EVERY_STEPS == 0 and consumed < budget:
                 checkpoint()
         bar.update(take)
         if micro % (tcfg.grad_accum * 5) == 0:
@@ -446,6 +589,9 @@ def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, device='cuda', force=False,
             bar.set_postfix(loss=f'{sum(running[-40:]) / len(running[-40:]):.4f}',
                             tok_s=f'{tok_seen / max(el, 1e-9):.0f}', refresh=False)
     bar.close()
+    kernels.__exit__(None, None, None)
+    if curve_steps and not any(c['step'] == opt_steps for c in curve):
+        curve_eval(opt_steps, consumed)         # the budget ended between two steps
     save(budget, sum(running[-40:]) / max(len(running[-40:]), 1),
          time.time() - t0, tok_seen)
     shutil.rmtree(ckpt, ignore_errors=True)
@@ -474,7 +620,8 @@ def load_for_eval(adapter_path, mcfg, tcfg, device='cuda'):
         tok.pad_token = tok.eos_token
     tok.padding_side = 'left'                       # required for batched generation
     model = AutoModelForCausalLM.from_pretrained(
-        mcfg.base_model, revision=mcfg.base_revision, dtype=getattr(torch, tcfg.dtype))
+        mcfg.base_model, revision=mcfg.base_revision, dtype=getattr(torch, tcfg.dtype),
+        attn_implementation=mcfg.attn_implementation)
     if adapter_path is not None:
         from peft import PeftModel
         model = PeftModel.from_pretrained(model, adapter_path)
@@ -564,7 +711,7 @@ def generate_answers(model, tok, problems, ecfg, device='cuda', desc='decode',
 # failures should read a few MB from disk rather than occupy a GPU again.
 
 def _decode_path(cond, dcfg, mcfg, tcfg, ecfg, trcfg):
-    spec = dict(task='gsm8k-decode', model=model_spec(cond, dcfg, mcfg, tcfg, trcfg),
+    spec = dict(task='exploretom-decode', model=model_spec(cond, dcfg, mcfg, tcfg, trcfg),
                 eval=eval_spec(ecfg), test=test_spec(dcfg))
     return os.path.join(DECODE_CACHE, _key(spec) + '.json')
 
@@ -666,31 +813,52 @@ def get_or_decode(get_model, problems, cond, dcfg, mcfg, tcfg, ecfg, trcfg,
 # ----------------------------------------------------------------------------
 
 def _eval_path(cond, dcfg, mcfg, tcfg, ecfg, trcfg):
-    spec = dict(task='gsm8k-eval', model=model_spec(cond, dcfg, mcfg, tcfg, trcfg),
+    spec = dict(task='exploretom-eval', model=model_spec(cond, dcfg, mcfg, tcfg, trcfg),
                 eval=eval_spec(ecfg), test=test_spec(dcfg))
     return os.path.join(EVAL_CACHE, _key(spec) + '.json')
 
 
 def cached_unit(cond, dcfg, mcfg, tcfg, ecfg, trcfg):
-    """The cached result for a unit, or None -- without loading any model."""
+    """The cached result for a unit (with the adapter's learning curve for a
+    fine-tuned condition), or None -- without loading any model."""
     path = _eval_path(cond, dcfg, mcfg, tcfg, ecfg, trcfg)
     if os.path.exists(path):
         with open(path) as f:
             r = json.load(f)
         r['cached'] = True
+        if cond != 'base':
+            r['curve'] = adapter_curve(cond, dcfg, mcfg, tcfg, trcfg, ecfg)
         return r
     return None
 
 
 def score(problems, outputs):
-    """Accuracy and the trace statistics behind it, over one decode."""
+    """
+    Accuracy and the statistics behind it, over one decode: `accuracy`
+    (rows), `robust` (test stories whose every row is correct), `answered`
+    (rows that wrote an answer field), `capped`, `mean_tokens`, and the
+    accuracy per question type and per true/false belief as
+    ``{name: [n_correct, n]}``.
+    """
     n = max(len(problems), 1)
-    n_ok = sum(is_correct(o['text'], p.gold) for p, o in zip(problems, outputs))
-    return dict(accuracy=n_ok / n,
-                answered=sum(ANSWER_MARKER in o['text'] for o in outputs) / n,
+    ok = [is_correct(o['text'], p.gold) for p, o in zip(problems, outputs)]
+    stories, by_type, by_belief = {}, {}, {}
+    for p, c in zip(problems, ok):
+        stories.setdefault(p.story_id, []).append(c)
+        by_type.setdefault(p.qtype, [0, 0])
+        by_type[p.qtype][0] += int(c)
+        by_type[p.qtype][1] += 1
+        k = 'false belief' if p.false_belief else 'true belief / factual'
+        by_belief.setdefault(k, [0, 0])
+        by_belief[k][0] += int(c)
+        by_belief[k][1] += 1
+    return dict(accuracy=sum(ok) / n,
+                robust=sum(all(v) for v in stories.values()) / max(len(stories), 1),
+                n_groups=len(stories),
+                answered=sum(extract_answer(o['text'])[1] for o in outputs) / n,
                 capped=sum(o['capped'] for o in outputs) / n,
                 mean_tokens=sum(o['n_tokens'] for o in outputs) / n,
-                n_eval=len(problems))
+                n_eval=len(problems), by_type=by_type, by_belief=by_belief)
 
 
 def _is_oom(exc):
@@ -711,36 +879,24 @@ def run_unit(cond, dcfg, mcfg, tcfg, ecfg, trcfg, device='cuda', force=False,
     canonical `ecfg`), continuing from the batches already on disk; only a
     genuine batch-1 OOM raises.
 
-    Params
-    ------
-    cond : str
-        One of `CONDITIONS`. The seed of a fine-tuned condition is `tcfg.seed`.
-    get_model : callable | None
-        Zero-argument callable returning ``(model, tokenizer)``, invoked only
-        if the decode is not cached. Defaults to training/loading on demand.
-    force : bool
-        Recompute even if cached.
-
     Returns
     -------
     dict
-        {'cond', 'seed', 'accuracy', 'answered', 'capped', 'mean_tokens',
-        'n_eval', 'seconds', 'cached'}
+        {'cond', 'seed', 'accuracy', 'robust', 'answered', 'capped',
+        'mean_tokens', 'n_eval', 'by_type', 'by_belief', 'seconds', 'cached'}
+        plus 'curve' for a fine-tuned condition.
     """
     seed = None if cond == 'base' else tcfg.seed
     path = _eval_path(cond, dcfg, mcfg, tcfg, ecfg, trcfg)
     if os.path.exists(path) and not force:
-        with open(path) as f:
-            r = json.load(f)
-        r['cached'] = True
-        return r
+        return cached_unit(cond, dcfg, mcfg, tcfg, ecfg, trcfg)
 
     problems = get_problems(dcfg, 'test')
     t0 = time.time()
 
     def _default_model():
         adapter = None if cond == 'base' else train_adapter(
-            cond, dcfg, mcfg, tcfg, trcfg, device=device, force=force, log=log,
+            cond, dcfg, mcfg, tcfg, trcfg, ecfg, device=device, force=force, log=log,
             progress_pos=progress_pos)
         return load_for_eval(adapter, mcfg, tcfg, device=device)
 
@@ -767,12 +923,16 @@ def run_unit(cond, dcfg, mcfg, tcfg, ecfg, trcfg, device='cuda', force=False,
     os.makedirs(EVAL_CACHE, exist_ok=True)
     tmp = path + f'.tmp{os.getpid()}'
     with open(tmp, 'w') as f:
-        json.dump(dict(r, samples=[dict(question=p.question, gold=p.gold,
-                                        pred=extract_answer(o['text']), text=o['text'])
-                                   for p, o in zip(problems[:20], outputs[:20])]),
+        json.dump(dict(r, samples=[dict(idx=p.idx, story_id=p.story_id, qtype=p.qtype,
+                                        false_belief=p.false_belief, question=p.question,
+                                        gold=p.gold, pred=extract_answer(o['text'])[0],
+                                        text=o['text'])
+                                   for p, o in zip(problems, outputs)]),
                   f, indent=1)
     os.replace(tmp, path)
-    log(f'{tag} acc={r["accuracy"]:.3f}  answered={r["answered"]:.3f}  '
+    log(f'{tag} acc={r["accuracy"]:.3f}  story={r["robust"]:.3f}  answered={r["answered"]:.3f}  '
         f'capped={r["capped"]:.3f}  mean {r["mean_tokens"]:.0f} tok  '
-        f'({r["seconds"]:.0f}s for {len(problems)} problems)')
+        f'({r["seconds"]:.0f}s for {len(problems)} rows)')
+    if cond != 'base':
+        r['curve'] = adapter_curve(cond, dcfg, mcfg, tcfg, trcfg, ecfg)
     return r

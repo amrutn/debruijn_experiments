@@ -1,7 +1,10 @@
 __pycache__/
+cache/
+figures/
+knockout_gen/
+knockout_ppl/
 *.txt
-!gsm8k_tuning/traces_ledger.txt
-!gsm8k_tuning/traces_distill_*.txt
+!exploretom_tuning/traces_distill_*.txt
 *.json
 *.csv
 .DS_Store
