@@ -153,16 +153,21 @@ def load_model(attn_implementation=None):
         dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
         device_map="auto" if DEVICE == "cuda" else None,
     )
-    if DEVICE == "cuda":
-        # Spread the weights EVENLY across all visible GPUs. Two placement traps to
-        # avoid: (a) plain device_map="auto" packs the model onto the fewest GPUs
-        # that fit; (b) an explicit per-GPU max_memory cap makes accelerate fill the
-        # low-index GPUs greedily and leave the rest empty. Both concentrate the
-        # weights on GPU 0, so the batched prefill activation (~17 GiB on the hot
-        # GPU at batch 64) lands on an already-loaded GPU and OOMs while GPUs sit
-        # idle. get_balanced_memory computes an EVEN per-GPU weight budget: a 14B
-        # model lands as ~5 GiB on each of 6 GPUs, leaving ~19 GiB free per GPU for
-        # the prefill activations and the growing KV cache.
+    if DEVICE == "cuda" and torch.cuda.device_count() > 1:
+        # MULTI-GPU ONLY. Spread the weights EVENLY across all visible GPUs. Two
+        # placement traps to avoid: (a) plain device_map="auto" packs the model onto
+        # the fewest GPUs that fit; (b) an explicit per-GPU max_memory cap makes
+        # accelerate fill the low-index GPUs greedily and leave the rest empty. Both
+        # concentrate the weights on GPU 0, so the batched prefill activation (~17 GiB
+        # on the hot GPU at batch 64) lands on an already-loaded GPU and OOMs while
+        # GPUs sit idle. get_balanced_memory computes an EVEN per-GPU weight budget: a
+        # 14B model lands as ~5 GiB on each of 6 GPUs, leaving ~19 GiB free per GPU.
+        #
+        # On a SINGLE GPU this path is skipped: low_zero=True reserves GPU 0 with no
+        # second GPU to take the overflow, so accelerate offloads the rest to CPU
+        # (huge host RSS) and then errors at load. With one GPU we fall through to
+        # device_map="auto", which places the whole model on cuda:0 (e.g. 32B ~64 GiB
+        # fits an 80/180 GiB H100/B200 with room to spare).
         try:
             from accelerate import init_empty_weights
             from accelerate.utils import get_balanced_memory

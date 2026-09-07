@@ -8,8 +8,9 @@ describe it in a paper. Code paths are given so each statement can be checked.
 Does fine-tuning a small model to keep a story's state in its local context,
 by restating each step and writing the exact world-and-belief state the
 question depends on after it (*state-tracking*), improve its accuracy on
-theory-of-mind questions more than fine-tuning on a question-specific chain
-of the decisive steps (*chain*), or on the answers alone (*direct*)? The
+theory-of-mind questions more than fine-tuning on the question-specific
+key steps that change the answer (*key-steps*), or on the answers alone
+(*direct*)? The
 state-tracking trace is local and De Bruijn-structured: each state line is a
 function of the previous state line and the steps since it, so answering
 never needs to look further back than the last state. To separate that
@@ -29,8 +30,9 @@ whole world state each step and became infeasible at ~13k tokens on the
 larger generated stories, and a *segment* condition that decoded the
 state-tracking trace one interval at a time; both were removed. Narration was
 added after the runs in §13, which therefore do not yet report it. The run
-records predate the removals and still name the removed conditions, with
-`focused` the former name of `state-tracking`.)
+records predate the removals and the renames and still use the old names, with
+`focused` the former name of `state-tracking` and `chain` the former name of
+`key-steps`.)
 
 ## 2. Benchmark
 
@@ -60,25 +62,93 @@ rendering of each story is also released but is not used here), generated
 adversarially against Llama-3.1-70B-Instruct with 2 to 4 people, 2 to 4
 moves, 1 or 2 rooms and at most 15 sentences.
 
-**Generated stories (`DataConfig(dataset='generated')`, `generate_stories`).**
-Because the sample saturates (§13), larger stories can be generated locally
-with no LLM: `generate_stories.sample_story` drives the belief tracker's DSL
-directly, applying a random sequence of valid actions (enter/leave a room,
-move an object to a container or a room, tell privately or out loud about a
-topic or a location, with optional peeking/distraction) of the requested
-size, so the `story_script` is a templated story with an exact state behind
-it. The tracker's `QuestionGenerator` gives the first- and second-order
-questions with ground-truth answers, emitted in the released CSV schema and
-run through the very same `build_problems` verification (parse, replay,
-reproduce every answer), so a generation bug drops a story rather than
-mislabels it. Sizes are set by the `gen_*` fields (`--dataset generated
---gen-people N --gen-moves N --gen-rooms N --gen-stories N`,
-`--gen-interesting-only` to keep only questions whose answer depends on who
-is asked); `gen_seed` and the sizes fix the set and are part of its cache
-key. Object-state updates and the factual (`memory`/`ground_truth`) question
-types are not generated. A 30-story generation at 6 people / 12 moves builds
-in seconds with zero parse/replay/verify failures, ~21 steps per story
-against the sample's ~7.
+### 2.1 Generating larger stories locally (`generate_stories.py`)
+
+Because the released sample saturates (a fine-tuned 1.5B model reaches ~0.91,
+§13), the harder half of the experiment runs on stories generated locally with
+`DataConfig(dataset='generated')`. This subsection documents that generator in
+full, including where it reuses the authors' code and where it departs from the
+ExploreToM paper's own data-generation pipeline.
+
+**What is reused vs. what is ours.** The ground truth is entirely the authors'
+code: `generate_stories` drives the pinned, **unmodified** `belief_tracker.py`
+— the `FullBeliefTracker` state machine and its `QuestionGenerator`, the same
+classes the released-sample path replays through (§3) — through their public API
+only. The generation *procedure* around them is **our own, separate
+implementation**: the entity pools, which tracker actions to sample and in what
+mix, the precondition-driven retry loop, and the templated-story assembly. We
+deliberately do **not** use the authors' data-generation pipeline — not their
+LLM context sampling, not their LLM-as-judge object-state filtering, and not
+their story-structure search. The only thing shared with the paper here is the
+tracker + question generator that guarantee our stories and answers are exactly
+consistent with the released benchmark.
+
+**Context, without an LLM.** ExploreToM samples each story's context (character
+names, roles, locations, objects, containers, discussion topics) with a *single
+zero-shot LLM call* so the elements are jointly coherent — autoregressive
+decoding proposes each element to fit the ones already chosen, avoiding
+ToMi-style commonsense violations (e.g. an apple stored in a bottle) that arise
+when objects and containers are sampled independently — and additionally samples
+object-state updates that an LLM-as-judge then filters for plausibility. **We
+implement none of this with an LLM.** Instead we use curated static entity pools
+defined once in `generate_stories.py`: 40 `NAMES` (the given names the released
+stories use), 20 `OBJECTS` (small, portable items), 12 `CONTAINERS`, 16 `ROOMS`
+and 12 `TOPICS` (abstract things one can "hear about"). The pools are hand-chosen
+so that *any* object × container × room combination already reads plausibly, so
+coherence is paid for once, at pool-design time, rather than per story by a
+model. For each story `sample_story` draws an independent random subset of each
+pool (`gen_people` names, `gen_rooms` rooms, `gen_objects` objects,
+`gen_containers` containers, `gen_topics` topics), then seeds the world by
+placing every person in a random room and every object once in a random
+container. We thus sample elements *independently* — the very thing the paper's
+LLM step is designed to avoid — and accept it because (a) the curated pools are
+mutually compatible and (b) we train and evaluate on the *templated* rendering
+(one sentence per action), where surface naturalness is immaterial and the exact
+belief dynamics from the tracker are what the experiment probes. We assign no
+roles, generate no object-state updates, and run no LLM judge.
+
+**Sampling the action sequence.** After the initial placement, up to `gen_moves`
+further actions are appended (`sample_story` → `_attempt`): repeatedly pick an
+action kind and try it with random valid-looking arguments; the tracker's own
+preconditions reject an impossible action (moving an object a person cannot see,
+telling about something unknown, …), which is skipped and retried, so only
+tracker-accepted actions ever enter `story_script`. The action kinds and their
+base weights are enter-room (2), leave-room (1), move-object-to-container (3),
+move-object-to-another-room (2), tell-privately-about-a-topic (2),
+tell-privately-an-object-location (3) and announce-to-the-room (2); `gen_comm`
+(default 0.35) tilts the mix between communication and physical actions. With
+probability `gen_peek` (default 0.3) a witnessable action also gets a secret
+watcher (an outsider in another room) or a distracted witness — the mechanism
+that creates false beliefs. A story is discarded unless enough of its attempted
+actions succeeded.
+
+**Questions.** The tracker's `QuestionGenerator` then emits the first- and
+second-order location, container and knowledge questions with ground-truth
+answers (`story_rows`); at most `gen_q_cap` (default 30) per story are kept, the
+*interesting* ones (whose answer depends on who is asked) first, so a large story
+does not swamp the build — a later `q_per_story` caps again per split. Factual
+(`memory` / `ground_truth`) questions are not emitted: they need the replayed
+action list that the verification rebuilds itself.
+
+**Emission, verification, determinism.** Each story is written as rows in the
+released CSV's exact schema (the columns `build_problems` reads), so generated
+data flows through the **same** parse → replay → verify pipeline as the released
+sample (§3): the generated text is parsed back into actions, replayed on a fresh
+tracker, and every emitted answer is re-derived and checked — a generation bug
+therefore drops a story rather than mislabelling one. Generation is fully
+determined by `gen_seed` and the sizes, which are part of the dataset's cache
+key, so a generated problem set is reproducible; sizes are set on the command
+line (`--dataset generated --gen-people N --gen-moves N --gen-rooms N
+--gen-stories N`, `--gen-interesting-only`). A 30-story preview at 6 people /
+12 moves builds in seconds with zero parse/replay/verify failures, ~21 steps per
+story against the sample's ~7.
+
+**Limitations vs. the paper's LLM pipeline.** Relative to ExploreToM's own
+generator we give up lexical variety (a fixed ~40 names / 20 objects / …), joint
+element coherence (mitigated, not eliminated, by pool curation and by using the
+templated rather than the infilled rendering), and object-state questions. In
+return the generation is deterministic, free of any model call, and verified
+end-to-end against the authors' tracker.
 
 ## 3. Recovering the states (`exploretom_data`)
 
@@ -121,7 +191,7 @@ questions are chosen (seeded). The first stories supply the **test set** until
 story supplies the **training pool** in order, and the training rows are the
 pool's first 1,500. Test and training stories are disjoint.
 
-The experiment is run over **five seeds** (`SEEDS`, `dcfg.seed = 0..4`), each a
+The experiment is run over **three seeds** (`SEEDS`, `dcfg.seed = 0..2`), each a
 different train/test split of the same story pool (and a different training
 seed); results are averaged and the error bars are the SEM over the seeds
 (§7). The table below is one representative split (seed 0).
@@ -154,7 +224,7 @@ and user turn `Story: <story structure>\n\nQuestion: <question>`.
 | Condition | Assistant turn |
 |---|---|
 | direct | `Answer: <answer>` |
-| chain | `Tracking the answer to the question through the story.` then, for each step at which the answer to *this* question changes, the step verbatim followed by `-> answer now: <answer after it>`; then the answer field. The running answer is obtained by regenerating the tracker's questions on every prefix (`_running_answers`); factual questions are read from the world state. Mean 1.2 quoted steps. |
+| key_steps (shown "key-steps") | `Tracking the answer to the question through the story.` then, for each step at which the answer to *this* question changes, the step verbatim followed by `-> answer now: <answer after it>`; then the answer field. The running answer is obtained by regenerating the tracker's questions on every prefix (`_running_answers`); factual questions are read from the world state. Mean 1.2 quoted steps. |
 | state_tracking (shown "state-tracking") | every step verbatim, each followed by the *question's slice* of the state (`FOCUS_STRIDE = 1`, `--focus-stride`); then the answer field. The slice (`focus_of`) keeps the people the question asks about and the object, container or topic it is about; a line with nothing relevant reads `State: nothing relevant yet.` Its beliefs are written *explicitly* (`FOCUS_BELIEFS = 'explicit'`, `--focus-beliefs`): on every line, each asked person's belief about the asked object ("Samantha believes the bookmark is in the paper bag" / "Samantha does not know where the bookmark is") or topic ("Nicholas has not heard about …"), and for a second-order question the asked person's view of the other ("Nicholas thinks Avery has not heard about …"), whether or not it departs from the truth. This is the local, De Bruijn-structured trace. |
 | narration | every step verbatim, each followed by a local `Note:` line describing just that step (`narration_note`): the event -- who entered or left a room, who moved which object where, who told whom what, who announced what -- and, for a witnessable action, who was present in the room, plus any secret watcher or distracted person; then the answer field. The note is **non-cumulative**: it names no running world or belief state, so unlike a state-tracking line the final note is not a sufficient statistic and answering requires integrating the notes across the story. This is the length-matched, non-De-Bruijn control (§1); it isolates the De Bruijn structure from the trace length and the restating. |
 
@@ -188,11 +258,11 @@ trace is sufficient for the test set by construction; a row it cannot answer
 is dropped at build time.
 
 **Token counts** (Qwen tokenizer, training rows, stride 1, released sample):
-prompt mean 206 (max 337); direct target mean 5; chain mean 46 (max 154);
+prompt mean 206 (max 337); direct target mean 5; key-steps mean 46 (max 154);
 state-tracking (explicit) mean 349 (max 1,454; prompt + target max 1,781);
 narration mean 240 (max 515). Narration restates the whole story with a
 per-step line, so it is the same order of magnitude as state-tracking (~0.69×
-on the sample) and far longer than chain or direct, while carrying no running
+on the sample) and far longer than key-steps or direct, while carrying no running
 state. On the larger generated stories (6 people / 12 moves) the state-tracking
 trace averages ~1.0-1.3k tokens and narration ~0.7-0.9k (~0.79×), the operating
 point at which the length match matters and where §13's runs separate the
@@ -223,7 +293,7 @@ State: Samantha is in the bookstore's back room; the bookmark is in the paper ba
 Answer: paper bag
 ```
 
-For the same row, the chain target is the single "told privately" step with
+For the same row, the key-steps target is the single "told privately" step with
 `-> answer now: paper bag`, and the direct target is the answer line alone.
 The **narration** target restates the same steps but replaces each state line
 with a local, non-cumulative note:
@@ -258,7 +328,7 @@ question under the student's prompt plus a request for at most 150 words of
 plain prose; the trace is kept if its normalised answer equals the label,
 else the row is recorded as FAILED and replaced by the next pool row, so the
 condition also trains on 1,500 rows (not exactly the rows of the other
-conditions). `run_experiments.py --conditions base,direct,chain,state_tracking,narration,distill`
+conditions). `run_experiments.py --conditions base,direct,key_steps,state_tracking,narration,distill`
 builds the file itself when it is short.
 
 ## 6. Model and fine-tuning
@@ -275,7 +345,7 @@ builds the file itself when it is short.
 | Batch | 8 sequences × 4 accumulation = 32 per optimizer step | `TrainConfig` |
 | Budget | 3 passes over the 1,500 rows = 4,500 samples, 141 optimizer steps; reshuffled each pass | `run_experiments.PASSES`, `train_cfg` |
 | Max sequence | 4,096 tokens (no training example exceeds it) | `TrainConfig.max_seq_len` |
-| Seeds | 5 replicates; each seed k is a different train/test split (`dcfg.seed = k`) **and** training seed (LoRA init + sample order). Results averaged, error bars SEM over the seeds; base re-evaluated per split | `run_experiments.SEEDS` |
+| Seeds | 3 replicates; each seed k is a different train/test split (`dcfg.seed = k`) **and** training seed (LoRA init + sample order). Results averaged, error bars SEM over the seeds; base re-evaluated per split | `run_experiments.SEEDS` |
 | Gradient checkpointing | on | `train_adapter` |
 
 ## 7. Evaluation
@@ -284,9 +354,9 @@ Greedy decoding (`EvalConfig.do_sample=False`), up to 2,048 new tokens,
 stopping at `<|im_end|>` / EOS, batched left-padded with prompts sorted
 longest first (batch 64; the batch size is not part of any cache key, and
 greedy decoding is batch-invariant). A reply that hits the cap is scored
-wrong and counted in `capped`. Each of the five seeds is scored on its own
+wrong and counted in `capped`. Each of the three seeds is scored on its own
 ~250-row test split; the reported number per condition is the **mean over the
-five seeds** and its error bar is the **SEM over the seeds** (with one seed it
+three seeds** and its error bar is the **SEM over the seeds** (with one seed it
 falls back to the binomial SEM over the test rows). Also reported: *story
 accuracy* (test stories with all their questions right), `answered`, `capped`,
 mean generated tokens, and accuracy per question type and for false-belief
@@ -300,8 +370,8 @@ final score. `curve_evals` is part of the adapter cache key (the curve is
 produced during training), so changing it retrains the adapters. RNG state is
 restored after each evaluation; the curve is stored in the adapter's
 `done.json` with the test and decoding specs it was scored under, and in
-every checkpoint. The untuned model is evaluated once and is the zero-sample
-point of every curve and the dashed horizontal line of both figures.
+every checkpoint. The untuned model is evaluated on each split and is the
+zero-sample point of every curve and the annotated dashed line of both figures.
 
 ## 8. Outputs
 
@@ -311,13 +381,14 @@ separate set of figures is written for each; the generated set's file names
 carry a `_gen-p<N>m<N>r<N>` suffix so the two never overwrite each other.
 
 `figures/exploretom_accuracy_<model>[_<teacher>][_gen-...].{pdf,png}`: accuracy
-per condition (bars, binomial SEM, dashed baseline; a distinct colour per
-condition). `figures/exploretom_curve_<model>[_<teacher>][_gen-...].{pdf,png}`:
-accuracy against training samples, one line per fine-tuned condition from the
-untuned model at zero samples, the untuned model's accuracy dashed. Both use
-the compact 3×2.5-inch style of the knockout figures in `../benchmarks`
-(14 pt axis labels, 12 pt ticks, 7 pt frameless legend, a faint grid, and no
-title). The console prints, for each dataset, the table, the pairwise
+per fine-tuned condition (bars, SEM over seeds, a distinct colour per
+condition, each seed a dot); the untuned model is not a bar but the annotated
+dashed line. `figures/exploretom_curve_<model>[_<teacher>][_gen-...].{pdf,png}`:
+accuracy against training iterations, one line per fine-tuned condition from the
+untuned model at zero samples, its accuracy dashed, with a 2-column legend at
+top-left. Both use the compact 3×2.5-inch style of the knockout figures in
+`../benchmarks` (14 pt axis labels, 12 pt ticks, 7 pt frameless legend, no grid
+and no title). The console prints, for each dataset, the table, the pairwise
 differences with their standard errors, the per-type table and the curve
 values.
 
@@ -325,7 +396,11 @@ Cache (`cache/`): `raw/` (the CSV and the tracker), `datasets/` (the parsed,
 verified problem set with every state line), `adapters/` (LoRA +
 `done.json`), `decodes/` (every completion), `evals/` (scores with every
 completion and its parsed answer). Keys are SHA-1 of the configs, so a
-changed setting recomputes only what depends on it.
+changed setting recomputes only what depends on it. A renamed condition keeps
+its cache: `exploretom_data.CACHE_ALIAS` keys it under the old name in the
+cache (only), so `key_steps` reuses the `chain` adapters/decodes/evals its
+byte-identical target already produced, and the rename alone triggers no
+recompute.
 
 ## 9. Robustness and numerical safety
 
@@ -344,8 +419,8 @@ kernel on a machine and reports which train cleanly.
 Python ≥ 3.10, `torch`, `transformers` (5.x; tested with 5.16), `peft`
 (0.20), `tqdm`, `numpy`, `matplotlib`; `anthropic` (1.x) only for an API
 teacher. The tracker needs only the standard library. The default runs both
-datasets over five seeds — about fifty units (2 datasets × 5 seeds × [1 base +
-4 conditions]) with twenty curve evaluations each — the better part of a day on
+datasets over three seeds — about thirty units (2 datasets × 3 seeds × [1 base +
+4 conditions]) with twenty curve evaluations each — several hours on
 one GPU (H100/B200 class); everything caches and resumes, and `--dataset
 sample`/`--dataset generated` and `--seeds N` cut it down. A CPU smoke test
 (`--n-train 8 --n-test 8 --q-per-story 2 --seeds 1` with a small model) exercises
@@ -357,9 +432,9 @@ every path.
 cd exploretom_tuning
 python exploretom_data.py --show 2                 # build + verify the problem set, print examples
 python check_train.py --device cuda:0              # optional kernel check
-python run_experiments.py --devices cuda:0         # BOTH datasets x 5 seeds, default conditions (the full run)
+python run_experiments.py --devices cuda:0         # BOTH datasets x 3 seeds, default conditions (the full run)
 python run_experiments.py --devices cuda:0 --dataset sample     # only the released-sample baseline
-python run_experiments.py --devices cuda:0 --conditions base,direct,chain,state_tracking,narration,distill
+python run_experiments.py --devices cuda:0 --conditions base,direct,key_steps,state_tracking,narration,distill
 python generate_stories.py --people 6 --moves 12 --stories 20 --show 1           # preview generated stories
 python run_experiments.py --devices cuda:0 --dataset generated  # only generated (default 6 people / 12 moves / 500 stories)
 python run_experiments.py --devices cuda:0 --dataset generated --gen-interesting-only  # false-belief-heavy
@@ -375,7 +450,7 @@ figures made with non-default settings carry a `_fs<n>` suffix.
 These runs predate the current defaults and are kept as a development log:
 they used a single seed, 200 test rows, 3 training passes and 10 curve
 evaluations, and the earlier condition names (`focused` = state-tracking; the
-removed `ledger`/`segment`). The current setup (§4–§8) is five seeds over
+removed `ledger`/`segment`). The current setup (§4–§8) is three seeds over
 different splits, 250 test rows, 3 passes, 20 curve evaluations, both datasets,
 with SEM over the seeds; re-running reproduces these trends with error bars.
 

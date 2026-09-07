@@ -1,8 +1,8 @@
 """
 Run the ExploreToM state-tracking experiment: does fine-tuning on reasoning
 that keeps the story's state in the local context (a restated step plus the
-exact world-and-belief state after it) beat fine-tuning on a question-specific
-chain of the decisive steps, or on the answers alone?
+exact world-and-belief state after it) beat fine-tuning on the question-specific
+key steps that change the answer, or on the answers alone?
 
 Models scored on the ExploreToM test rows (`exploretom_data`):
 
@@ -10,8 +10,9 @@ base            Qwen2.5-1.5B-Instruct as released, no fine-tuning, under the
                 same prompt. ``--base-model Qwen/Qwen2.5-1.5B`` runs the
                 pretrained model instead (`train_eval.BASE_MODELS`).
 direct          a LoRA trained on the answer field alone of the training rows.
-chain           a LoRA trained on the *same* rows with the steps at which the
+key_steps       a LoRA trained on the *same* rows with the steps at which the
                 answer to the question changes, each with the answer after it.
+                Shown as "key-steps".
 state_tracking  a LoRA trained on the same rows with the story restated and
                 the *question's slice* of the state -- the people asked about,
                 the object or topic -- after every step (``--focus-stride``),
@@ -33,11 +34,11 @@ distill         optional (``--conditions ...,distill``): a LoRA trained on a
                 where the teacher was right (`traces.py`; Qwen3-32B run
                 locally by default, built by this script if the file is short).
 
-The chain, state_tracking and narration targets are computed from the
+The key_steps, state_tracking and narration targets are computed from the
 replayed story, so the exact conditions are trained on identical rows with
 identical labels and differ in the format of the reasoning only. Training is LoRA r=32 on every
 projection, lr 1e-4 cosine, effective batch 32, over three passes of the rows.
-The whole thing is repeated over five seeds, each an independent train/test
+The whole thing is repeated over three seeds, each an independent train/test
 split (and training seed); results are averaged and the error bars are the SEM
 over the seeds. While an adapter trains it is scored twenty times on the test
 set (`TrainConfig.curve_evals`), which gives the learning curve.
@@ -58,8 +59,9 @@ exploretom_accuracy_<model>[_<teacher>][_gen-p<N>m<N>r<N>]
                           and each seed's own accuracy as a dot, and the untuned
                           model's mean accuracy as a dashed line.
 exploretom_curve_<model>[_<teacher>][_gen-p<N>m<N>r<N>]
-                          Test accuracy against training samples, one line per
-                          fine-tuned condition (mean over seeds) starting from
+                          Test accuracy against training iterations (optimizer
+                          steps), one line per fine-tuned condition (mean over
+                          seeds) starting from
                           the untuned model at zero samples, a shaded +/-1 SEM
                           band over the seeds, and the untuned model's accuracy
                           as a dashed horizontal line.
@@ -87,7 +89,7 @@ Usage
     python run_experiments.py                                   # auto devices, both datasets
     python run_experiments.py --dataset sample                  # only the released sample
     python run_experiments.py --dataset generated --gen-people 6 --gen-moves 12 --gen-stories 500
-    python run_experiments.py --conditions base,direct,chain,state_tracking,distill
+    python run_experiments.py --conditions base,direct,key_steps,state_tracking,distill
     python run_experiments.py --plot-only                       # figures from cache (both sets)
     python run_experiments.py --n-train 16 --n-test 12          # smoke test
 """
@@ -111,6 +113,7 @@ from dataclasses import replace
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgba
 
 from exploretom_data import (
     DataConfig, get_problems, train_pool, DATASETS, FOCUS_STRIDE, FOCUS_BELIEFS, BELIEF_MODES,
@@ -154,9 +157,9 @@ EVAL = EvalConfig(max_new_tokens=2048, batch_size=64)
 # seeds and the error bars are the SEM over them -- the spread that reflects
 # both the data split and the training randomness. The untuned base model is
 # re-evaluated on each split.
-SEEDS = 5
+SEEDS = 3
 
-COND_LABEL = {'base': 'base', 'direct': 'direct', 'chain': 'chain',
+COND_LABEL = {'base': 'base', 'direct': 'direct', 'key_steps': 'key-steps',
               'state_tracking': 'state-tracking', 'narration': 'narration', 'distill': 'distill'}
 
 
@@ -202,8 +205,8 @@ BAND_ALPHA = 0.3
 
 # A distinct, publication-friendly colour per line: the untuned model is grey,
 # the hero state-tracking condition is black, and the others take well-separated
-# hues (direct blue, chain orange, narration red, distill green).
-COND_COLOR = {'base': '#8c8c8c', 'direct': '#4c72b0', 'chain': '#dd8452',
+# hues (direct blue, key-steps orange, narration red, distill green).
+COND_COLOR = {'base': '#8c8c8c', 'direct': '#4c72b0', 'key_steps': '#dd8452',
               'state_tracking': '#000000', 'narration': '#c44e52', 'distill': '#55a868'}
 
 
@@ -214,10 +217,11 @@ def _apply_style():
                          'legend.fontsize': LEGEND_FS})
 
 
-def _style_axis(ax, grid='both'):
+def _style_axis(ax, grid=None):
     ax.tick_params(labelsize=TICK_FS)
-    ax.set_axisbelow(True)
-    ax.grid(True, axis=grid, alpha=0.3)
+    if grid:
+        ax.set_axisbelow(True)
+        ax.grid(True, axis=grid, alpha=0.3)
 
 
 def _save(fig, name, subdir=''):
@@ -472,44 +476,47 @@ def summarise(results):
 
 
 def plot_accuracy_bars(results, name='exploretom_accuracy', subdir=''):
-    """Test accuracy per condition as bars, with the SEM of `summarise` as a
-    black error bar, the untuned model's level dashed, and, with several
-    seeds, the individual seeds as dots."""
+    """Test accuracy per fine-tuned condition as bars, with the SEM of
+    `summarise` as a black error bar and, with several seeds, the individual
+    seeds as dots. The untuned model is the annotated dashed line, not a bar."""
     _apply_style()
     stats = summarise(results)
-    conds = [c for c in CONDITIONS if c in stats]
+    conds = [c for c in CONDITIONS if c in stats and c != 'base']   # base is the dashed line
     if not conds:
         return None
     fig, ax = plt.subplots(figsize=FIGSIZE)
     xs = np.arange(len(conds))
     for x, c in zip(xs, conds):
         s = stats[c]
-        ax.bar(x, s['mean'], width=0.62, color=COND_COLOR[c], zorder=3)
+        ax.bar(x, s['mean'], width=0.62, facecolor=to_rgba(COND_COLOR[c], 0.3),
+               edgecolor=COND_COLOR[c], linewidth=1.6, zorder=3)
         ax.errorbar(x, s['mean'], yerr=s['sem'], fmt='none', ecolor='black',
                     elinewidth=1.0, capsize=3, capthick=1.0, zorder=4)
         if len(s['accs']) > 1:
             jit = np.linspace(-0.13, 0.13, len(s['accs']))
             ax.plot(x + jit, s['accs'], ls='none', marker='o', ms=2.8, color='black',
                     alpha=0.75, zorder=5)
-    if 'base' in stats:
-        ax.axhline(stats['base']['mean'], color=COND_COLOR['base'], lw=1.1,
-                   ls=(0, (5, 3)), zorder=2)
     ax.set_xticks(xs)
     ax.set_xticklabels([COND_LABEL[c] for c in conds], rotation=30, ha='right')
     ax.set_xlim(-0.6, len(conds) - 0.4)
     ax.set_ylim(0, 1)
+    if 'base' in stats:
+        b = stats['base']['mean']
+        ax.axhline(b, color=COND_COLOR['base'], lw=1.1, ls=(0, (5, 3)), zorder=2)
+        ax.text(len(conds) - 0.5, b + 0.015, 'not-tuned', ha='right', va='bottom',
+                fontsize=LEGEND_FS, color=COND_COLOR['base'])
     ax.set_ylabel('Test Accuracy')
-    _style_axis(ax, grid='y')
+    _style_axis(ax)
     return _save(fig, name, subdir)
 
 
 def curve_stats(results):
     """
-    Per fine-tuned condition: the training-sample positions of the curve
-    evaluations and the mean and SEM over seeds of the accuracy at each
-    (seeds are aligned by evaluation index; they share the schedule). The
-    untuned model is prepended as the zero-sample point of every curve, using
-    each seed's own base evaluation so its mean and SEM match the base bar.
+    Per fine-tuned condition: the optimizer-step (training-iteration) positions
+    of the curve evaluations and the mean and SEM over seeds of the accuracy at
+    each (seeds are aligned by evaluation index; they share the schedule). The
+    untuned model is prepended as the step-0 point of every curve, using each
+    seed's own base evaluation so its mean and SEM match the base bar.
     """
     base_pts = [r['curve'][0] for r in results if r['cond'] == 'base' and r.get('curve')]
     out = {}
@@ -523,9 +530,9 @@ def curve_stats(results):
         pts = [[c[i] for c in curves] for i in range(n)]
         if base_pts:
             pts.insert(0, base_pts)         # the untuned model on each seed's split
-        xs = [float(np.mean([p['samples'] for p in row])) for row in pts]
+        xs = [float(np.mean([p['step'] for p in row])) for row in pts]
         accs = [np.array([p['accuracy'] for p in row]) for row in pts]
-        out[cond] = dict(samples=xs, mean=[float(a.mean()) for a in accs],
+        out[cond] = dict(iterations=xs, mean=[float(a.mean()) for a in accs],
                          sem=[float(a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else 0.0
                               for a in accs], n_seeds=len(curves))
     base_acc = float(np.mean([p['accuracy'] for p in base_pts])) if base_pts else None
@@ -533,30 +540,37 @@ def curve_stats(results):
 
 
 def plot_accuracy_curve(results, name='exploretom_curve', subdir=''):
-    """Test accuracy against training samples, one line per fine-tuned
-    condition (mean over seeds, SEM shaded when there are several), with the
-    untuned model's accuracy as a dashed horizontal line and as the common
-    starting point."""
+    """Test accuracy against training iterations (optimizer steps), one line per
+    fine-tuned condition (mean over seeds, SEM shaded when there are several),
+    with the untuned model's accuracy as a dashed horizontal line and as the
+    common starting point (iteration 0)."""
     _apply_style()
     stats, base_acc = curve_stats(results)
     if not stats:
         return None
     fig, ax = plt.subplots(figsize=FIGSIZE)
+    handles = {}
     for cond, s in stats.items():
-        x, m, e = np.array(s['samples']), np.array(s['mean']), np.array(s['sem'])
-        ax.plot(x, m, marker='o', ms=3, lw=LINE_LW, color=COND_COLOR[cond],
-                label=COND_LABEL[cond], zorder=3)
+        x, m, e = np.array(s['iterations']), np.array(s['mean']), np.array(s['sem'])
+        (handles[cond],) = ax.plot(x, m, lw=LINE_LW, color=COND_COLOR[cond],
+                                   label=COND_LABEL[cond], zorder=3)
         if s['n_seeds'] > 1:
             ax.fill_between(x, m - e, m + e, color=COND_COLOR[cond], alpha=BAND_ALPHA,
                             lw=0, zorder=2)
     if base_acc is not None:
-        ax.axhline(base_acc, color=COND_COLOR['base'], lw=1.1, ls=(0, (5, 3)),
-                   label='base', zorder=1)
-    ax.set_xlabel('Training samples')
+        handles['base'] = ax.axhline(base_acc, color=COND_COLOR['base'], lw=1.1,
+                                     ls=(0, (5, 3)), label='not-tuned', zorder=1)
+    ax.set_xlabel('Training Iterations')
     ax.set_ylabel('Test Accuracy')
     ax.set_ylim(0, 1)
     ax.set_xlim(left=0)
-    ax.legend(frameon=False, handlelength=1.5, loc='lower right')
+    # state-tracking first (top-left of the legend), the not-tuned line last; the
+    # 5 default entries fill 2 columns as a 2x2x1 block
+    order = [c for c in (['state_tracking'] + [c for c in stats if c != 'state_tracking']
+                         + ['base']) if c in handles]
+    ax.legend([handles[c] for c in order], [handles[c].get_label() for c in order],
+              frameon=False, handlelength=1.5, loc='upper left', ncol=2,
+              columnspacing=1.0, handletextpad=0.5)
     _style_axis(ax)
     return _save(fig, name, subdir)
 
@@ -567,10 +581,10 @@ def print_curve(results):
     if not stats:
         return
     conds = list(stats)
-    xs = max((s['samples'] for s in stats.values()), key=len)
+    xs = max((s['iterations'] for s in stats.values()), key=len)
     print('\nlearning curve (test accuracy; base = '
           + (f'{base_acc:.3f})' if base_acc is not None else 'n/a)'))
-    print('  samples ' + ''.join(f'{COND_LABEL[c]:>10}' for c in conds))
+    print('  iters   ' + ''.join(f'{COND_LABEL[c]:>10}' for c in conds))
     for i, x in enumerate(xs):
         row = ''.join(f'{stats[c]["mean"][i]:10.3f}' if i < len(stats[c]['mean']) else ' ' * 10
                       for c in conds)
@@ -599,9 +613,9 @@ def print_summary(results, trcfg, mcfg=None):
         if len(s['accs']) > 1:
             print(f'  {cond} per seed: ' + '  '.join(
                 f's{sd}={a:.3f}' for sd, a in zip(s['seeds'], s['accs'])))
-    for a, b in (('state_tracking', 'narration'), ('state_tracking', 'chain'),
-                 ('state_tracking', 'direct'), ('narration', 'chain'), ('narration', 'direct'),
-                 ('chain', 'direct'), ('distill', 'state_tracking')):
+    for a, b in (('state_tracking', 'narration'), ('state_tracking', 'key_steps'),
+                 ('state_tracking', 'direct'), ('narration', 'key_steps'), ('narration', 'direct'),
+                 ('key_steps', 'direct'), ('distill', 'state_tracking')):
         if a in stats and b in stats:
             d = stats[a]['mean'] - stats[b]['mean']
             e = (stats[a]['sem'] ** 2 + stats[b]['sem'] ** 2) ** 0.5
@@ -681,7 +695,7 @@ def _n_rows_for(dcfg, conditions, args, trcfg, devices):
     if n_pool < dcfg.n_train:
         print(f'WARNING: the training pool holds {n_pool} rows, fewer than the {dcfg.n_train} '
               'asked for; the exact conditions train on all of them', flush=True)
-    for c in ('direct', 'chain', 'state_tracking', 'narration'):
+    for c in ('direct', 'key_steps', 'state_tracking', 'narration'):
         n_rows[c] = n_train_actual
     if 'distill' in conditions:
         try:

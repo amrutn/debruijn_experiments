@@ -34,10 +34,10 @@ with the answer field ``Answer: <answer>``.
 
 Training targets (the assistant turn a condition is fine-tuned on)
 ------------------------------------------------------------------
-direct   the answer field alone: ``Answer: leather briefcase``.
-chain    the sentences at which the answer to *this question* changes, each
-         quoted with the answer as it stands after it, then the answer field
-         -- a question-specific chain that skips the rest of the story:
+direct     the answer field alone: ``Answer: leather briefcase``.
+key_steps  the sentences at which the answer to *this question* changes, each
+           quoted with the answer as it stands after it, then the answer field
+           -- the question-specific key steps that skip the rest of the story:
 
              Tracking the answer to the question through the story.
              Kaylee moved the silver letter opener to the wooden desk drawer, ... -> answer now: wooden desk drawer
@@ -128,8 +128,8 @@ TRACKER_SHA256 = '0a00f85034735dc0b0b6da787152d643a4243db3624bfda09f75af20b2743b
 ANSWER_MARKER = 'Answer:'
 STATE_PREFIX = 'State:'
 NOTE_PREFIX = 'Note:'
-CHAIN_HEADER = 'Tracking the answer to the question through the story.'
-CHAIN_ARROW = '-> answer now:'
+KEY_STEPS_HEADER = 'Tracking the answer to the question through the story.'
+KEY_STEPS_ARROW = '-> answer now:'
 
 SYSTEM_PROMPT = (
     'You read a short story and answer a question about it. You may reason '
@@ -148,7 +148,20 @@ SYSTEM_PROMPT = (
 TRACE_VERSION = '4'
 # The version of each condition's target text, for the adapter cache keys:
 # a bump of TRACE_VERSION re-makes only the adapters whose text changed.
-TARGET_VERSIONS = {'direct': '2', 'chain': '2', 'state_tracking': '3', 'narration': '2'}
+TARGET_VERSIONS = {'direct': '2', 'key_steps': '2', 'state_tracking': '3', 'narration': '2'}
+
+# A renamed condition keeps using the cache written under its old name: its
+# training target is byte-identical, so the old adapters/decodes/evals stay
+# valid. `cache_cond` maps the current name to the name the cache is keyed
+# under -- used ONLY inside cache keys, never for the target text itself (and
+# `TARGET_VERSIONS` is still looked up by the current name, whose version
+# equals the old one). key_steps was formerly `chain`.
+CACHE_ALIAS = {'key_steps': 'chain'}
+
+
+def cache_cond(cond):
+    """The condition name a cache key is written under (see `CACHE_ALIAS`)."""
+    return CACHE_ALIAS.get(cond, cond)
 
 # State-tracking stride: a state line after every block of this many steps
 # (blocks as even as possible, the earlier ones taking the extra step; the
@@ -730,7 +743,8 @@ class Problem:
     departures, `focused_explicit` the same with every asked belief stated
     (`FOCUS_BELIEFS`), `chain` the steps at
     which the answer to this question changes as ``[(step index, answer so
-    far)]``, `qtype` a short label ('knowledge-2', 'container-1', 'room-2',
+    far)]`` (the `key_steps` target's content), `qtype` a short label
+    ('knowledge-2', 'container-1', 'room-2',
     'memory', ...), `false_belief` whether the asked belief differs from the
     truth.
     """
@@ -996,11 +1010,12 @@ def direct_target(problem):
     return answer_line(problem.gold)
 
 
-def chain_target(problem):
-    """The steps at which the answer changes, each with the answer after it."""
-    lines = [CHAIN_HEADER]
+def key_steps_target(problem):
+    """The key steps at which the answer changes, each with the answer after it
+    (`problem.chain` holds the precomputed (step index, answer) pairs)."""
+    lines = [KEY_STEPS_HEADER]
     for i, ans in problem.chain:
-        lines.append(f'{problem.steps[i]} {CHAIN_ARROW} {ans}')
+        lines.append(f'{problem.steps[i]} {KEY_STEPS_ARROW} {ans}')
     lines.append(answer_line(problem.gold))
     return '\n'.join(lines)
 
@@ -1101,7 +1116,7 @@ def narration_target(problem):
     return '\n'.join(lines)
 
 
-TARGETS = {'direct': direct_target, 'chain': chain_target,
+TARGETS = {'direct': direct_target, 'key_steps': key_steps_target,
            'state_tracking': state_tracking_target, 'narration': narration_target}
 
 # Version of the local story generator (`generate_stories`); part of the

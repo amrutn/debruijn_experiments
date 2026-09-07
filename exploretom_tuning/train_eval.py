@@ -3,7 +3,7 @@ Fine-tune Qwen2.5-1.5B-Instruct on ExploreToM training targets and score it
 on the ExploreToM test rows.
 
 Adapters are trained on the same 1,500 training questions -- on the answer
-alone (direct), on the question-specific chain of decisive steps (chain), on
+alone (direct), on the question-specific key steps that change the answer (key_steps), on
 the story restated with the question's slice of the state after each step
 (state_tracking, the local De Bruijn trace), on the story restated with a
 local per-step note that carries no running state (narration, the length-
@@ -74,7 +74,7 @@ from tqdm.auto import tqdm
 
 from exploretom_data import (
     get_problems, is_correct, extract_answer, user_message,
-    train_spec, test_spec, _key, CACHE, SYSTEM_PROMPT,
+    train_spec, test_spec, _key, cache_cond, CACHE, SYSTEM_PROMPT,
 )
 from traces import target_spec, training_examples
 
@@ -97,8 +97,8 @@ BASE_REVISION = BASE_MODELS[BASE_MODEL]
 # story restated with the question's running world-and-belief state after each
 # step); shown as "state-tracking". 'distill' needs teacher traces and is not
 # run unless asked for.
-CONDITIONS = ('base', 'direct', 'chain', 'state_tracking', 'narration', 'distill')
-DEFAULT_CONDITIONS = ('base', 'direct', 'chain', 'state_tracking', 'narration')
+CONDITIONS = ('base', 'direct', 'key_steps', 'state_tracking', 'narration', 'distill')
+DEFAULT_CONDITIONS = ('base', 'direct', 'key_steps', 'state_tracking', 'narration')
 
 
 # ----------------------------------------------------------------------------
@@ -224,8 +224,8 @@ def model_spec(cond, dcfg, mcfg, tcfg, trcfg):
     if cond == 'base':
         return dict(task='exploretom', cond='base', base_model=mcfg.base_model,
                     base_revision=mcfg.base_revision)
-    return dict(task='exploretom', cond=cond, data=train_spec(dcfg), model=asdict(mcfg),
-                train=asdict(tcfg), targets=target_spec(cond, trcfg, dcfg))
+    return dict(task='exploretom', cond=cache_cond(cond), data=train_spec(dcfg),
+                model=asdict(mcfg), train=asdict(tcfg), targets=target_spec(cond, trcfg, dcfg))
 
 
 # ----------------------------------------------------------------------------
@@ -321,7 +321,7 @@ def adapter_curve(cond, dcfg, mcfg, tcfg, trcfg, ecfg):
 def train_adapter(cond, dcfg, mcfg, tcfg, trcfg, ecfg, device='cuda', force=False,
                   log=print, progress_pos=0):
     """
-    Fine-tune a LoRA for `cond` ('direct', 'chain', 'state_tracking' or
+    Fine-tune a LoRA for `cond` ('direct', 'key_steps', 'state_tracking' or
     'distill'), or reuse the cached one.
 
     Training consumes `tcfg.total_samples` samples from the pool, reshuffling
@@ -826,6 +826,7 @@ def cached_unit(cond, dcfg, mcfg, tcfg, ecfg, trcfg):
         with open(path) as f:
             r = json.load(f)
         r['cached'] = True
+        r['cond'] = cond            # a cache written under an alias reports the current name
         if cond != 'base':
             r['curve'] = adapter_curve(cond, dcfg, mcfg, tcfg, trcfg, ecfg)
         return r

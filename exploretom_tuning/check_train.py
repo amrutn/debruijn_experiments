@@ -17,7 +17,7 @@ minute per setting on a GPU. Whatever passes can be selected for the
 experiment with ``--attn`` / ``--sdpa-backends`` of `run_experiments`.
 
     python check_train.py                          # first GPU, state-tracking targets
-    python check_train.py --device cuda:0 --steps 2 --cond chain
+    python check_train.py --device cuda:0 --steps 2 --cond key_steps
     python check_train.py --only default,eager     # a subset of the settings
 """
 
@@ -147,7 +147,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
     ap.add_argument('--cond', default='state_tracking',
-                    choices=('direct', 'chain', 'state_tracking', 'narration', 'distill'))
+                    choices=('direct', 'key_steps', 'state_tracking', 'narration', 'distill'))
     ap.add_argument('--steps', type=int, default=2, help='optimizer steps per setting')
     ap.add_argument('--batch', type=int, default=8)
     ap.add_argument('--accum', type=int, default=4)

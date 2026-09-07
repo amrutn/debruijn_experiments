@@ -2,15 +2,17 @@
 Training targets per condition, and the teacher-written traces of the
 optional distillation condition.
 
-Three conditions need no teacher: their targets are computed exactly from
+Four conditions need no teacher: their targets are computed exactly from
 the replayed story (`exploretom_data.TARGETS`):
 
 direct          the answer field alone,
-chain           the steps at which the answer to the question changes,
+key_steps       the steps at which the answer to the question changes,
 state_tracking  the story restated with the question's slice of the state
                 after each block of `focus_stride` steps (every step by
                 default), the asked beliefs written explicitly
-                (`focus_beliefs`).
+                (`focus_beliefs`),
+narration       the story restated with a local per-step note, no running
+                state (the length-matched non-De-Bruijn control).
 
 The fourth, `distill`, trains on a teacher model's own reasoning: the teacher
 answers the training question under the student's prompt (plus a request for
@@ -61,7 +63,7 @@ from exploretom_data import (
     DataConfig, get_problems, train_pool, user_message, question_hash, answer_line,
     extract_answer, normalise, train_spec, TARGETS, state_tracking_target,
     SYSTEM_PROMPT, TRACE_VERSION, TARGET_VERSIONS, FOCUS_STRIDE, FOCUS_BELIEFS,
-    HERE,
+    cache_cond, HERE,
 )
 
 TEACHER = 'hf:Qwen/Qwen3-32B'
@@ -72,7 +74,7 @@ HF_REVISIONS = {
 }
 # Conditions whose targets are computed exactly from the replayed story
 # (no teacher).
-EXACT = ('direct', 'chain', 'state_tracking', 'narration')
+EXACT = ('direct', 'key_steps', 'state_tracking', 'narration')
 
 _HEADER = re.compile(r'^### row (\d+) q=([0-9a-f]{8})( FAILED)?$')
 
@@ -112,7 +114,9 @@ def target_spec(cond, tcfg, dcfg):
     conditions by the target version and the training rows; the distill
     condition by the teacher and the digest of its trace file too.
     """
-    spec = dict(task='exploretom-targets', cond=cond, data=train_spec(dcfg),
+    # `cache_cond` keys a renamed condition under its old name (key_steps ->
+    # chain); TARGET_VERSIONS is still read by the current name (same version).
+    spec = dict(task='exploretom-targets', cond=cache_cond(cond), data=train_spec(dcfg),
                 trace_version=TARGET_VERSIONS.get(cond, tcfg.trace_version))
     if cond == 'state_tracking':
         spec['stride'] = tcfg.focus_stride
@@ -491,7 +495,7 @@ def main():
         for p in keep[:args.show]:
             print('=' * 72)
             print(user_message(p))
-            for name in ('direct', 'chain', 'state_tracking', 'narration'):
+            for name in ('direct', 'key_steps', 'state_tracking', 'narration'):
                 print('-' * 26 + f' {name} ' + '-' * 26)
                 print(target_fn(name, tcfg)(p))
             print('-' * 26 + ' distill ' + '-' * 25)
