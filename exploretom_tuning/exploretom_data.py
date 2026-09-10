@@ -200,7 +200,7 @@ class DataConfig:
     seed: int = 0                   # story order and the choice of questions within a split
     dataset: str = 'sample'         # 'sample' | 'generated'
     # generation (used only when dataset == 'generated'):
-    gen_people: int = 6
+    gen_people: int = 4            # 4 keeps the answer distribution far less skewed than 6 (see §4.1)
     gen_rooms: int = 3
     gen_objects: int = 4
     gen_containers: int = 3

@@ -45,11 +45,25 @@ set (`TrainConfig.curve_evals`), which gives the learning curve.
 
 Datasets
 --------
-By default the whole experiment is run twice and a separate set of figures is
-written for each: on the larger locally-generated stories (`generated`, the
-"positive" set that separates the formats) and on the released ExploreToM
-sample (`sample`, the near-saturated "negative" baseline where the good formats
-tie). Pass `--dataset generated` or `--dataset sample` to run just one.
+The default dataset is the larger locally-generated stories (`generated`,
+`DataConfig`: 4 people / 12 moves / 3 rooms, 500 stories) -- the "positive" set
+that separates the reasoning formats. 4 people (not 6) keeps the answer
+distribution far less skewed (the majority baseline is ~0.38 rather than ~0.56;
+see REPRODUCIBILITY.md §4.1). Pass `--dataset sample` for the released ExploreToM
+sample -- the near-saturated "negative" baseline where the good formats tie
+(kept as a comparison, no longer run by default).
+
+Stride sweep (`--stride-sweep`)
+-------------------------------
+A separate ablation: train state_tracking at several state-emission intervals
+(`STRIDE_SWEEP`: a state line after every block of k steps, plus the no-interval
+"std." case where the state is written only once at the end), with a final
+evaluation only (no learning curve), over `SEEDS` splits of the generated data.
+Writes `exploretom_stride_<tag>` -- final accuracy vs interval, SEM over seeds,
+in the same format as the `math_task` accuracy-vs-k figure. The bare default
+(`python run_experiments.py`) runs the generated main experiment and then this
+sweep; `--stride-sweep` runs only the sweep; an explicit `--dataset X` runs only
+that dataset's main experiment (no sweep).
 
 Figures (pdf+png in figures/)
 -----------------------------
@@ -85,12 +99,12 @@ says whether anything failed.
 
 Usage
 -----
-    python run_experiments.py --devices cuda:0                  # BOTH datasets, one GPU
-    python run_experiments.py                                   # auto devices, both datasets
-    python run_experiments.py --dataset sample                  # only the released sample
-    python run_experiments.py --dataset generated --gen-people 6 --gen-moves 12 --gen-stories 500
+    python run_experiments.py --devices cuda:0                  # generated main run + stride sweep
+    python run_experiments.py --dataset sample                  # the released-sample baseline (no sweep)
+    python run_experiments.py --stride-sweep --devices cuda:0   # only the state-emission-interval ablation
+    python run_experiments.py --dataset generated --gen-people 6      # override: the more-skewed 6-person set
     python run_experiments.py --conditions base,direct,key_steps,state_tracking,distill
-    python run_experiments.py --plot-only                       # figures from cache (both sets)
+    python run_experiments.py --plot-only                       # figures from cache
     python run_experiments.py --n-train 16 --n-test 12          # smoke test
 """
 
@@ -158,6 +172,15 @@ EVAL = EvalConfig(max_new_tokens=2048, batch_size=64)
 # both the data split and the training randomness. The untuned base model is
 # re-evaluated on each split.
 SEEDS = 3
+
+# `--stride-sweep` ablation: the state-emission intervals to train state_tracking
+# at (a state line after every block of this many steps). STRIDE_NONE is a
+# sentinel larger than any story length, so `blocks()` yields a single block and
+# the state is written only once, at the end of the story -- the "no interval"
+# case. Plotted as accuracy vs interval, final eval only, over `SEEDS` seeds.
+STRIDE_NONE = 10 ** 6
+STRIDE_SWEEP = (1, 2, 3, 4, 5, 6, STRIDE_NONE)
+STRIDE_LABELS = '1,2,3,4,5,6,std.'
 
 COND_LABEL = {'base': 'base', 'direct': 'direct', 'key_steps': 'key-steps',
               'state_tracking': 'state-tracking', 'narration': 'narration', 'distill': 'distill'}
@@ -418,8 +441,8 @@ def print_plan(units, dcfg, trcfg, devices, force, setup=None):
     print('rough cost     : on an H100 or B200 ~3-10 min of training per adapter (the state-')
     print('                 tracking and narration targets are long) plus ~1-4 min per evaluation')
     print(f'                 of the test rows (x{tc.curve_evals + 1} with the curve), so ~20-60 min per unit;')
-    print(f'                 the default runs both datasets x {SEEDS} seeds -- many units, plan for')
-    print('                 the better part of a day on one GPU (everything caches/resumes)')
+    print(f'                 the bare default is the generated main run + the stride sweep x {SEEDS}')
+    print('                 seeds -- many units, hours on one GPU (everything caches/resumes)')
     print('-' * 66, flush=True)
 
 
@@ -589,6 +612,70 @@ def print_curve(results):
         row = ''.join(f'{stats[c]["mean"][i]:10.3f}' if i < len(stats[c]['mean']) else ' ' * 10
                       for c in conds)
         print(f'  {x:7.0f} {row}')
+
+
+def plot_stride_sweep(stride_accs, cond_accs, name='exploretom_stride', subdir=''):
+    """
+    Final-answer accuracy of state_tracking vs the state-emission interval, in the
+    `math_task` accuracy-vs-k format: a line with markers over the finite
+    intervals; the no-interval / final-state-only case ("std.", the `STRIDE_NONE`
+    sentinel) as a detached diamond one slot past the largest interval, across a
+    thin divider and joined by a dashed connector; and a **horizontal dashed
+    reference line for each fixed (interval-independent) condition** in
+    `cond_accs` -- base ("not-tuned"), direct, key_steps, narration -- at its
+    mean-over-seeds accuracy, coloured by condition and named in the legend.
+    Means over seeds with +/-1 SEM bars; `stride_accs` maps a stride to its
+    per-seed accuracies, `cond_accs` a condition to its per-seed accuracies.
+    """
+    from matplotlib.lines import Line2D
+    _apply_style()
+    strides = [s for s in STRIDE_SWEEP if stride_accs.get(s)]
+    if not strides:
+        return None
+    ks = [s for s in strides if s != STRIDE_NONE]
+    kmax = max(ks) if ks else 1
+    has_std = STRIDE_NONE in strides
+    xstd = kmax + 1.6                                     # std sits one slot right of kmax
+    color = COND_COLOR['state_tracking']
+    mean = lambda v: float(np.mean(v))                                                # noqa: E731
+    sem = lambda v: float(np.std(v, ddof=1) / np.sqrt(len(v))) if len(v) > 1 else 0.0  # noqa: E731
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    handles = [Line2D([0], [0], color=color, lw=1.5, marker='o', ms=4,
+                      label=COND_LABEL['state_tracking'])]
+    # a horizontal dashed reference line per fixed condition, coloured by condition
+    for cond, lbl in (('base', 'not-tuned'), ('direct', COND_LABEL['direct']),
+                      ('key_steps', COND_LABEL['key_steps']),
+                      ('narration', COND_LABEL['narration'])):
+        v = cond_accs.get(cond)
+        if not v:
+            continue
+        ax.axhline(mean(v), color=COND_COLOR[cond], lw=1.1, ls=(0, (5, 3)), zorder=1)
+        handles.append(Line2D([0], [0], color=COND_COLOR[cond], lw=1.1, ls=(0, (5, 3)), label=lbl))
+    xs, ys = ks, [mean(stride_accs[s]) for s in ks]
+    if ks:                                               # the finite-interval sweep
+        ax.errorbar(xs, ys, yerr=[sem(stride_accs[s]) for s in ks], marker='o', ms=4.2,
+                    lw=1.5, color=color, capsize=2.5, elinewidth=0.9, zorder=3)
+    if has_std:                                          # the no-interval ("std.") case
+        ystd = mean(stride_accs[STRIDE_NONE])
+        if ks:
+            ax.plot([xs[-1], xstd], [ys[-1], ystd], ls=(0, (3, 2)), lw=1.2, color=color, zorder=2)
+        ax.axvline(kmax + 0.8, color='0.85', lw=0.8, zorder=0)   # separates std
+        ax.errorbar([xstd], [ystd], yerr=[sem(stride_accs[STRIDE_NONE])], marker='D', ms=5.5,
+                    color=color, ls='none', capsize=2.5, elinewidth=0.9, zorder=4)
+    ax.set_xticks(ks + ([xstd] if has_std else []))
+    ax.set_xticklabels([str(k) for k in ks] + (['std.'] if has_std else []))
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel('Interval $k$', fontsize=LABEL_FS)
+    ax.set_ylabel('Final-Answer Accuracy', fontsize=LABEL_FS)
+    ax.tick_params(labelsize=TICK_FS)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    leg = ax.legend(handles=handles, fontsize=LEGEND_FS - 1, frameon=True, loc='lower center',
+                    ncol=2, handlelength=1.6, handletextpad=0.5, columnspacing=1.1,
+                    labelspacing=0.3, borderpad=0.35, facecolor='white', edgecolor='0.8',
+                    framealpha=1.0)
+    leg.get_frame().set_linewidth(0.7)
+    return _save(fig, name, subdir)
 
 
 def print_summary(results, trcfg, mcfg=None):
@@ -768,6 +855,90 @@ def run_one_dataset(dcfg, conditions, args, devices, mcfg, tcfg, trcfg):
     return failed
 
 
+def run_stride_sweep(base_dcfg, args, devices, mcfg, tcfg, trcfg):
+    """
+    Ablation of the state-emission interval: train state_tracking at each
+    `STRIDE_SWEEP` stride (a state line after every block of that many steps;
+    the `STRIDE_NONE` sentinel emits the state only once, at the end), with a
+    final evaluation only (no learning curve), over `args.seeds` independent
+    splits of the generated data. Writes `exploretom_stride_<tag>` (accuracy vs
+    interval, SEM over seeds) with a horizontal dashed reference line for each
+    fixed condition -- not-tuned (base), direct, key_steps, narration -- taken
+    from the main run's cache, and prints the table. Returns failed unit-results.
+    """
+    dcfg0 = replace(base_dcfg, dataset='generated')
+    tcfg0 = replace(tcfg, curve_evals=0)                 # no intermediate evaluations
+    model_tag = args.base_model.split('/')[-1].lower()
+    tag = model_tag + f'_gen-p{dcfg0.gen_people}m{dcfg0.gen_moves}r{dcfg0.gen_rooms}'
+    if trcfg.focus_beliefs != FOCUS_BELIEFS:
+        tag += f'_f{trcfg.focus_beliefs[:3]}'
+    labels = ['std.' if s == STRIDE_NONE else str(s) for s in STRIDE_SWEEP]
+    print('\n' + '=' * 66)
+    print(f'STRIDE SWEEP (state_tracking): intervals {labels}, {args.seeds} seed(s), '
+          'final eval only, generated data')
+    print('=' * 66, flush=True)
+
+    # fixed (interval-independent) conditions overlaid as dashed reference lines:
+    # `base` is evaluated here (cheap), the others are loaded from the main run's
+    # cache with its own `tcfg` (never trained by the sweep) and omitted if absent.
+    REF_CONDS = ('direct', 'key_steps', 'narration')
+    stride_accs = {s: [] for s in STRIDE_SWEEP}
+    cond_accs = {c: [] for c in ('base',) + REF_CONDS}
+    failed = []
+    for k in range(args.seeds):
+        dcfg_k = replace(dcfg0, seed=k)
+        nr = _n_rows_for(dcfg_k, ('direct', 'key_steps', 'state_tracking', 'narration'),
+                         args, trcfg, devices)
+        sweep_setup = Setup(mcfg, tcfg0, nr)             # sweep training: curve_evals=0
+        ref_setup = Setup(mcfg, tcfg, nr)                # main tcfg -> reuse the main run's cache
+
+        def collect(units, trc, setup, sink, load_only=False):
+            res = (load_cached(units, dcfg_k, trc, setup) if (args.plot_only or load_only)
+                   else run_all(units, dcfg_k, trc, devices, args.force, setup))
+            for r in res:
+                if r is None:
+                    continue
+                if 'error' in r:
+                    r['seed'] = k
+                    failed.append(r)
+                else:
+                    sink.append(r['accuracy'])
+
+        collect([('base', k)], trcfg, sweep_setup, cond_accs['base'])   # untuned reference
+        for c in REF_CONDS:                              # fixed-condition lines from the main run
+            collect([(c, k)], trcfg, ref_setup, cond_accs[c], load_only=True)
+        for s in STRIDE_SWEEP:                           # the interval sweep
+            lbl = 'std.' if s == STRIDE_NONE else str(s)
+            if not args.plot_only:
+                print(f'\n[stride {lbl}] seed {k}', flush=True)
+            collect([('state_tracking', k)], replace(trcfg, focus_stride=s), sweep_setup, stride_accs[s])
+
+    stride_accs = {s: v for s, v in stride_accs.items() if v}
+    missing = [c for c in REF_CONDS if not cond_accs[c]]
+    if missing:
+        print(f'  (no cached main-run results for {missing}; their reference lines are omitted -- '
+              'run the generated main experiment to include them)', flush=True)
+    path = plot_stride_sweep(stride_accs, cond_accs, name=f'exploretom_stride_{tag}')
+    if path:
+        print(f'\n[stride-sweep] wrote {path}.pdf/.png  (state_tracking vs interval; dashed lines '
+              f'= fixed conditions; mean over {args.seeds} seed(s))')
+
+    def _row(lbl, v):
+        v = np.array(v)
+        s = float(v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 1 else 0.0
+        print(f'  {lbl:>16}    {v.mean():6.3f}   {s:6.3f}   ({len(v)})')
+    print('\nstride sweep -- final test accuracy (mean +/- SEM over seeds):')
+    print('  condition/interval      acc     sem   (seeds)')
+    for s in STRIDE_SWEEP:
+        if s in stride_accs:
+            _row('k=' + ('std.' if s == STRIDE_NONE else str(s)), stride_accs[s])
+    for c, lbl in (('base', 'not-tuned'), ('direct', 'direct'),
+                   ('key_steps', 'key-steps'), ('narration', 'narration')):
+        if cond_accs.get(c):
+            _row(lbl, cond_accs[c])
+    return failed
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -785,8 +956,8 @@ def main():
     ap.add_argument('--q-per-story', type=int, default=DATA.q_per_story,
                     help='at most this many questions per story in either split')
     ap.add_argument('--dataset', choices=DATASETS, default=None,
-                    help="'sample' (released ExploreToM) or 'generated' (larger local stories); "
-                         "default runs BOTH and writes a set of figures for each")
+                    help="'generated' (larger local stories, the default) or 'sample' (the "
+                         "released ExploreToM baseline)")
     ap.add_argument('--gen-people', type=int, default=DATA.gen_people)
     ap.add_argument('--gen-rooms', type=int, default=DATA.gen_rooms)
     ap.add_argument('--gen-moves', type=int, default=DATA.gen_moves,
@@ -800,6 +971,11 @@ def main():
                          + ' is pinned to its recorded revision')
     ap.add_argument('--focus-stride', type=int, default=FOCUS_STRIDE,
                     help='state-tracking: a state line after every block of this many steps')
+    ap.add_argument('--stride-sweep', action='store_true',
+                    help=f'run ONLY the ablation: train state_tracking at emission intervals '
+                         f'{STRIDE_LABELS} (final accuracy only, no curve) on the generated data '
+                         'and plot accuracy vs interval. The bare default runs this sweep after '
+                         'the generated main experiment; an explicit --dataset skips it')
     ap.add_argument('--focus-beliefs', choices=BELIEF_MODES, default=FOCUS_BELIEFS,
                     help="state-tracking: write the asked beliefs on every line ('explicit') or "
                          "only where they depart from the truth ('departures')")
@@ -830,9 +1006,8 @@ def main():
     devices = args.devices.split(',') if args.devices else _default_devices()
 
     # the model/optimiser/trace settings are shared across datasets; only the
-    # DataConfig changes. Default (`--dataset` unset) runs both datasets, the
-    # generated ("positive") set first and the released sample ("negative"
-    # baseline) second, each writing its own set of figures.
+    # DataConfig changes. The default dataset is the generated one; pass
+    # `--dataset sample` for the (saturated) released-sample baseline.
     mcfg = replace(MODEL, base_model=args.base_model,
                    base_revision=BASE_MODELS.get(args.base_model), attn_implementation=args.attn)
     tcfg = replace(TRAIN, sdpa_backends=args.sdpa_backends,
@@ -843,16 +1018,20 @@ def main():
                         gen_people=args.gen_people, gen_rooms=args.gen_rooms,
                         gen_moves=args.gen_moves, gen_stories=args.gen_stories,
                         gen_seed=args.gen_seed, gen_interesting_only=args.gen_interesting_only)
-    datasets = [args.dataset] if args.dataset else ['generated', 'sample']
 
-    failed = []
-    for i, ds in enumerate(datasets):
-        if len(datasets) > 1:
-            print('\n' + '=' * 66)
-            print(f'DATASET {i + 1}/{len(datasets)}: {ds}')
-            print('=' * 66, flush=True)
-        dcfg = replace(base_dcfg, dataset=ds)
-        failed += run_one_dataset(dcfg, conditions, args, devices, mcfg, tcfg, trcfg)
+    # `--stride-sweep` alone runs only the state-emission-interval ablation. The
+    # bare default (no explicit `--dataset`) runs the main experiment on the
+    # generated data AND then the sweep; an explicit `--dataset X` runs only that
+    # dataset's main experiment. The sweep trains state_tracking at several
+    # intervals (final accuracy only, no learning curve) on the generated data.
+    if args.stride_sweep:
+        failed = run_stride_sweep(base_dcfg, args, devices, mcfg, tcfg, trcfg)
+    else:
+        ds = args.dataset or 'generated'
+        failed = run_one_dataset(replace(base_dcfg, dataset=ds), conditions, args,
+                                 devices, mcfg, tcfg, trcfg)
+        if args.dataset is None:                 # bare default: main run + the sweep
+            failed += run_stride_sweep(base_dcfg, args, devices, mcfg, tcfg, trcfg)
 
     if failed:
         print('\nFAILED units (cached work is kept; rerun to retry them):')

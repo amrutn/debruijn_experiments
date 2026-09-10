@@ -139,9 +139,9 @@ therefore drops a story rather than mislabelling one. Generation is fully
 determined by `gen_seed` and the sizes, which are part of the dataset's cache
 key, so a generated problem set is reproducible; sizes are set on the command
 line (`--dataset generated --gen-people N --gen-moves N --gen-rooms N
---gen-stories N`, `--gen-interesting-only`). A 30-story preview at 6 people /
-12 moves builds in seconds with zero parse/replay/verify failures, ~21 steps per
-story against the sample's ~7.
+--gen-stories N`, `--gen-interesting-only`). A 30-story preview at the default 4
+people / 12 moves builds in seconds with zero parse/replay/verify failures, ~19
+steps per story against the sample's ~7.
 
 **Limitations vs. the paper's LLM pipeline.** Relative to ExploreToM's own
 generator we give up lexical variety (a fixed ~40 names / 20 objects / …), joint
@@ -194,7 +194,9 @@ pool's first 1,500. Test and training stories are disjoint.
 The experiment is run over **three seeds** (`SEEDS`, `dcfg.seed = 0..2`), each a
 different train/test split of the same story pool (and a different training
 seed); results are averaged and the error bars are the SEM over the seeds
-(§7). The table below is one representative split (seed 0).
+(§7). The table below is one representative split of the **released sample**
+(seed 0); the generated set's type breakdown is in §4.1, and the types
+themselves are described there.
 
 | Split | Questions | Stories | Question types (reasoning order suffix; `*` = false belief) |
 |---|---|---|---|
@@ -205,6 +207,75 @@ Test rows (seed 0) by people: 2 → 100, 3 → 68, 4 → 84; by rooms: 1 → 176
 2 → 76. Answers: yes/no, "knows about it" / "does not know about it", or a
 container, room or object name. Stories average 7.2 steps and 77 words (max
 178, 15 steps).
+
+### 4.1 Question types
+
+Every question is read off the tracker's ground-truth state (so each has one
+correct answer) and is defined by two axes — **what is queried** and the
+**reasoning order** (the `-1`/`-2` suffix).
+
+*What is queried.*
+
+- **knowledge** — awareness of a *topic* (the abstract things characters
+  communicate: "guest list", "maintenance backlog", …), answered yes/no
+  ("knows about it" / "does not know about it").
+  - `knowledge-1` — a person's own awareness: *"Does Elijah know about guest
+    list?"* → **yes**.
+  - `knowledge-2` — a person's model of another's awareness: *"What does Elijah
+    think about Aubrey's belief on maintenance backlog? (knows about it / does
+    not know about it)"* → **does not know about it**.
+- **container** — which *container* a person believes holds an object (where
+  they would search); the answer is a container name.
+  - `container-1`: *"In which container will Caleb search for the compass?"* →
+    **wicker basket**.
+  - `container-2`: *"In which container does Charlotte think that Julia will
+    search for the glass paperweight?"* → **velvet pouch**.
+- **room** — the same for the coarser *room* location (a person can know the
+  room but not the container).
+  - `room-2`: *"In which room does William think that Emily will search for the
+    brass key?"* → **reading room**. (`room-1` exists but is rare.)
+- **sample only** — `ground_truth` (the object's *actual* current location; no
+  ToM) and `memory` (where it was *before* an event) appear in the released
+  sample but are **not generated** and are dropped in the pipeline anyway (§3),
+  so they never reach a model.
+
+*Reasoning order.* Order 1 is a person's own mental state; order 2 is a person's
+model of *another* person's state (nested ToM, e.g. `container-2` = Charlotte's
+belief about Julia's belief). Second-order questions scale with ordered
+person-pairs, so they are the largest class and grow sharply with the number of
+people (which is why the default is 4, not 6 — see the breakdown below).
+
+*False belief.* A question is *false-belief* when the queried belief differs
+from reality — the character missed the decisive event (Caleb searches the
+wicker basket because the compass moved after he left). These are the core ToM
+cases: the model must answer from the character's belief, not the true state.
+`knowledge-1` is never false-belief (one's own awareness is simply present or
+not).
+
+**Breakdown (generated test set; default 4 people / 12 moves, seed 0; 252
+questions, 75 false-belief):**
+
+| type | n | share | answer space | majority answer | false-belief |
+|---|---|---|---|---|---|
+| knowledge-2 | 129 | 51% | binary (knows / doesn't) | 0.74 ("does not know") | 44 |
+| knowledge-1 | 50 | 20% | binary (yes / no) | 0.56 | 0 |
+| room-2 | 30 | 12% | 14 rooms | 0.23 | 10 |
+| container-1 | 22 | 9% | 11 containers | 0.18 | 8 |
+| container-2 | 21 | 8% | 8 containers | 0.29 | 13 |
+
+Second-order knowledge is still the largest class (51%) but no longer
+overwhelming, and its "does not know" share has eased (0.85 → 0.74). Overall the
+set is **71% binary** with "does not know about it" at **38%** of all answers, so
+the naive baselines are much lower than at 6 people — always answering the most
+common label scores **0.381** and uniform-random guessing **~0.38**, so accuracy
+above ~0.38 is genuinely above the prior (versus a 0.56 majority floor at 6
+people). The default was set to **4 people** for exactly this reason: it keeps
+the answer distribution far less skewed. The alternatives are worse — 6 people
+pushes the majority floor to 0.56, and `--gen-interesting-only` does **not**
+flatten the skew (it slightly reduces the false-belief share). Still report the
+majority baseline and the per-type / false-belief accuracy (§7) alongside the
+headline. The trade-off at 4 vs 6 people: slightly fewer false-belief questions
+(30% vs 39%) and shorter stories (~19 vs ~21 steps).
 
 ## 5. Prompt, targets and grading
 
@@ -263,10 +334,10 @@ state-tracking (explicit) mean 349 (max 1,454; prompt + target max 1,781);
 narration mean 240 (max 515). Narration restates the whole story with a
 per-step line, so it is the same order of magnitude as state-tracking (~0.69×
 on the sample) and far longer than key-steps or direct, while carrying no running
-state. On the larger generated stories (6 people / 12 moves) the state-tracking
-trace averages ~1.0-1.3k tokens and narration ~0.7-0.9k (~0.79×), the operating
-point at which the length match matters and where §13's runs separate the
-formats.
+state. On the larger generated stories (the default 4 people / 12 moves) the
+state-tracking trace averages ~920 tokens (max ~1.9k) and narration ~650
+(~0.71×), the operating point at which the length match matters and where §13's
+runs separate the formats.
 
 **Grading** (`extract_answer`, `is_correct`): the text after the last
 `Answer` field (first line), lower-cased, with markdown, brackets, a leading
@@ -375,10 +446,12 @@ zero-sample point of every curve and the annotated dashed line of both figures.
 
 ## 8. Outputs
 
-By default the experiment is run on **both** datasets (the generated
-"positive" set and the released-sample "negative" baseline, §11) and a
-separate set of figures is written for each; the generated set's file names
-carry a `_gen-p<N>m<N>r<N>` suffix so the two never overwrite each other.
+The bare default (`python run_experiments.py`) runs the **generated** main
+experiment and then the **stride sweep** (below), both on the generated data.
+`--dataset sample` runs the released-sample "negative" baseline instead (its
+figures carry no `_gen-...` suffix); an explicit `--dataset` skips the sweep.
+The generated figures' file names carry a `_gen-p<N>m<N>r<N>` suffix so the two
+datasets never overwrite each other.
 
 `figures/exploretom_accuracy_<model>[_<teacher>][_gen-...].{pdf,png}`: accuracy
 per fine-tuned condition (bars, SEM over seeds, a distinct colour per
@@ -388,9 +461,18 @@ accuracy against training iterations, one line per fine-tuned condition from the
 untuned model at zero samples, its accuracy dashed, with a 2-column legend at
 top-left. Both use the compact 3×2.5-inch style of the knockout figures in
 `../benchmarks` (14 pt axis labels, 12 pt ticks, 7 pt frameless legend, no grid
-and no title). The console prints, for each dataset, the table, the pairwise
-differences with their standard errors, the per-type table and the curve
-values.
+and no title).
+
+`figures/exploretom_stride_<model>_gen-...{pdf,png}` (the `--stride-sweep`
+ablation): state_tracking's final test accuracy vs the state-emission interval
+*k* (1..6), the no-interval "std." case as a detached diamond one slot past the
+axis, and the untuned model as an inline-labelled dashed reference; means over
+seeds with SEM bars. This one is drawn in the same format as `../math_task`'s
+accuracy-vs-*k* figure (top/right spines removed, 8 pt legend).
+
+The console prints, per run, the table, the pairwise differences with their
+standard errors, the per-type table, and (main run) the curve values or
+(sweep) the accuracy per interval.
 
 Cache (`cache/`): `raw/` (the CSV and the tracker), `datasets/` (the parsed,
 verified problem set with every state line), `adapters/` (LoRA +
@@ -432,11 +514,12 @@ every path.
 cd exploretom_tuning
 python exploretom_data.py --show 2                 # build + verify the problem set, print examples
 python check_train.py --device cuda:0              # optional kernel check
-python run_experiments.py --devices cuda:0         # BOTH datasets x 3 seeds, default conditions (the full run)
-python run_experiments.py --devices cuda:0 --dataset sample     # only the released-sample baseline
+python run_experiments.py --devices cuda:0         # generated main run + stride sweep, 3 seeds (the full default)
+python run_experiments.py --devices cuda:0 --stride-sweep       # only the state-emission-interval ablation
+python run_experiments.py --devices cuda:0 --dataset sample     # only the released-sample baseline (no sweep)
 python run_experiments.py --devices cuda:0 --conditions base,direct,key_steps,state_tracking,narration,distill
 python generate_stories.py --people 6 --moves 12 --stories 20 --show 1           # preview generated stories
-python run_experiments.py --devices cuda:0 --dataset generated  # only generated (default 6 people / 12 moves / 500 stories)
+python run_experiments.py --devices cuda:0 --dataset generated  # only the generated main run (no sweep)
 python run_experiments.py --devices cuda:0 --dataset generated --gen-interesting-only  # false-belief-heavy
 python run_experiments.py --plot-only              # figures from the cache
 python analyze_ledger.py --stride 1               # where the state-tracking model's state lines go wrong
@@ -451,7 +534,8 @@ These runs predate the current defaults and are kept as a development log:
 they used a single seed, 200 test rows, 3 training passes and 10 curve
 evaluations, and the earlier condition names (`focused` = state-tracking; the
 removed `ledger`/`segment`). The current setup (§4–§8) is three seeds over
-different splits, 250 test rows, 3 passes, 20 curve evaluations, both datasets,
+different splits, 250 test rows, 3 passes, 20 curve evaluations, the generated
+dataset by default (plus the stride sweep; `--dataset sample` for the baseline),
 with SEM over the seeds; re-running reproduces these trends with error bars.
 
 **Run 1 (2026-09-06; both ledgers at stride 2, focused beliefs as

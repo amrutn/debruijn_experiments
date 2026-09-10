@@ -866,7 +866,7 @@ def grade_answer(kind, text, gold):
     return _norm_math(text) == _norm_math(gold)
 
 def sample_top_p(logits, temperature, top_p):
-    """Sample one token id from `logits` with temperature + nucleus (top-p)."""
+    """Sample one token id from `logits` (1-D) with temperature + nucleus (top-p)."""
     logits = logits.float() / max(temperature, 1e-6)
     probs = torch.softmax(logits, dim=-1)
     sp, si = torch.sort(probs, descending=True)
@@ -876,6 +876,35 @@ def sample_top_p(logits, temperature, top_p):
     sp = torch.where(keep, sp, torch.zeros_like(sp))
     sp = sp / sp.sum()
     return int(si[torch.multinomial(sp, 1)])
+
+def sample_top_p_batch(logits, temperature, top_p):
+    """Vectorized top-p sampling over a (B, V) logit batch -- the hot path for
+    batched generation. The deterministic part (temperature, softmax, sort,
+    cumulative nucleus mask, renormalize) is batched into one kernel each instead
+    of B separate calls, which removes the B per-step full-vocab sorts that
+    dominated decode time. The multinomial draws are then done PER ROW IN ORDER
+    (b = 0..B-1), exactly as the per-sequence loop did, so the global RNG stream --
+    and therefore every sampled token -- is byte-for-byte unchanged; only a single
+    device->host sync happens per step (via one .tolist()) instead of B. Returns a
+    python list of B token ids.
+
+    (Values are identical to calling sample_top_p() per row: softmax/sort/cumsum
+    are elementwise/row-wise. The sole theoretical difference is torch.sort tie
+    ordering between the batched and 1-D kernels, which does not occur for distinct
+    fp32 probabilities.)"""
+    logits = logits.float() / max(temperature, 1e-6)
+    probs = torch.softmax(logits, dim=-1)                       # (B, V)
+    sp, si = torch.sort(probs, dim=-1, descending=True)         # (B, V), (B, V)
+    cum = torch.cumsum(sp, dim=-1)
+    keep = (cum - sp) < top_p
+    keep[:, 0] = True
+    sp = torch.where(keep, sp, torch.zeros_like(sp))
+    sp = sp / sp.sum(dim=-1, keepdim=True)
+    B = sp.shape[0]
+    idx = torch.empty(B, dtype=torch.long, device=sp.device)
+    for b in range(B):                                          # per-row draw, in order -> same RNG
+        idx[b] = si[b, torch.multinomial(sp[b], 1)]
+    return idx.tolist()                                         # single host sync
 
 _LOGITS_KEEP_OK = None
 
@@ -932,7 +961,21 @@ def _evict_window(cache, keep_prefix, keep_suffix):
     def trim(t):
         if keep_suffix <= 0:                       # keep only the prompt sink
             return t[:, :, :keep_prefix]
-        return torch.cat([t[:, :, :keep_prefix], t[:, :, -keep_suffix:]], dim=2)
+        L = t.shape[2]
+        if L <= keep_prefix + keep_suffix:         # window not yet full: nothing to evict
+            return t
+        # Evict the oldest window token(s) with an IN-PLACE left shift of the
+        # window region only. The prompt prefix [0:keep_prefix] is already in
+        # place and is NEVER copied. The previous torch.cat re-copied the whole
+        # (prompt + window) cache into a freshly allocated tensor every step, for
+        # every layer -- ~20 GiB of copy + allocation per step at batch 96 on
+        # GPQA's long prompts -- which ballooned reserved memory to the GPU
+        # ceiling and made the allocator thrash (the dominant per-step cost).
+        # Values are identical to the old cat([prefix, last keep_suffix]).
+        drop = L - keep_prefix - keep_suffix
+        win = t[:, :, keep_prefix + drop:].clone()          # only the window: tiny vs the prompt
+        t[:, :, keep_prefix:keep_prefix + keep_suffix].copy_(win)
+        return t[:, :, :keep_prefix + keep_suffix]          # narrow view, no new allocation
     layers = getattr(cache, 'layers', None)
     if layers:
         for layer in layers:
@@ -991,7 +1034,7 @@ def knockout_generate_batch(model, tokenizer, prompts_ids, n, args, eos_ids, pad
     cur = [P[b] for b in range(B)]                      # true position of the next token
     win_len = 0                                         # window tokens currently in cache
     for _ in range(args.gen_max_new_tokens):
-        toks = [sample_top_p(logits[b], args.gen_temperature, args.gen_top_p) for b in range(B)]
+        toks = sample_top_p_batch(logits, args.gen_temperature, args.gen_top_p)
         for b in range(B):
             if not finished[b]:
                 gens[b].append(toks[b])
@@ -1693,6 +1736,10 @@ def run_knockout_generation(tokenizer):
                         correct[i, col] = 1 if grade_answer(kind, text, items[i]['gold']) else 0
                         lengths[i, col] = int(ln)
                     save_gen(name, correct, lengths, cns, _gen_meta(ARGS, kind, correct.shape[0]))
+                    if DEVICE == "cuda":
+                        # release the finished batch's reserved KV / prefill blocks so the
+                        # next batch's (large) prompt prefill doesn't start at the ceiling
+                        torch.cuda.empty_cache()
 
         # accuracy uses the first nprob rows (this run's problem set)
         csub = correct[:nprob]
