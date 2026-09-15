@@ -1,4 +1,5 @@
 *reproducibility*
+logs/
 __pycache__/
 cache/
 figures/
