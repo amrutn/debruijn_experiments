@@ -81,11 +81,14 @@ def parse_args():
                    help="HF model id to evaluate (e.g. Qwen/Qwen3-32B, Qwen/Qwen3-14B). "
                         "Caches are namespaced per model, so switching does not clobber "
                         "another model's results.")
-    p.add_argument('--compare-model', type=str, default=None,
+    p.add_argument('--compare-model', type=str, default="Qwen/Qwen3-32B",
                    help="HF model id whose CACHED knockout-generation results are "
                         "overlaid as dashed curves on the accuracy/length plots (read "
                         "only -- run the experiment once with --model <id> first to "
-                        "populate its cache). e.g. --compare-model Qwen/Qwen3-32B.")
+                        "populate its cache). Default Qwen/Qwen3-32B, so the 32B "
+                        "comparison is drawn automatically whenever its cache exists "
+                        "(it is skipped if it matches --model or has no cache). Pass "
+                        "--compare-model '' to disable the overlay.")
     p.add_argument('--num-samples', type=int, default=None,
                    help="cap problems per dataset before computing (default: all; "
                         "use to bound cost, especially for GSM8K).")
@@ -1325,13 +1328,16 @@ def _setup_memory_log_xaxis(ax, x, x_full, any_full):
     ax.set_xticks(ticks)
     ax.set_xticklabels(labels)
 
-def _model_style_legend(ax, primary_label, cmp_label, loc):
+def _model_style_legend(ax, primary_label, cmp_label, loc, bbox_to_anchor=None):
     """Small solid/dashed legend distinguishing the two models (only when a
-    comparison model is overlaid); benchmark identity stays color-coded."""
+    comparison model is overlaid); benchmark identity stays color-coded.
+    `bbox_to_anchor` (axes fraction) nudges the legend without changing `loc`,
+    e.g. (0, 1.06) lifts an upper-left legend about one text line."""
     from matplotlib.lines import Line2D
     handles = [Line2D([0], [0], color='0.25', ls='-', lw=1.8, label=primary_label),
                Line2D([0], [0], color='0.25', ls='--', lw=1.8, label=cmp_label)]
-    ax.legend(handles=handles, loc=loc, frameon=False, handlelength=1.8)
+    kw = {} if bbox_to_anchor is None else {'bbox_to_anchor': bbox_to_anchor}
+    ax.legend(handles=handles, loc=loc, frameon=False, handlelength=1.8, **kw)
 
 def plot_knockout_generation_results(results, n_values, results_cmp=None,
                                      primary_label=None, cmp_label=None):
@@ -1369,7 +1375,8 @@ def plot_knockout_generation_results(results, n_values, results_cmp=None,
     ax.set_ylim(bottom=0.0, top=1.0)
     _setup_memory_log_xaxis(ax, x, x_full, any_full)
     if results_cmp:
-        _model_style_legend(ax, primary_label, cmp_label, loc='upper left')
+        _model_style_legend(ax, primary_label, cmp_label, loc='upper left',
+                            bbox_to_anchor=(-0.03, 1.03))  # nudged just above/left of the corner
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     os.makedirs(FIGURES_DIR, exist_ok=True)
@@ -1461,8 +1468,6 @@ def plot_knockout_generation_lengths_combined(table, n_values, table_cmp=None,
     ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))  # ->  x10^4 offset, shorter labels
     ax.yaxis.get_offset_text().set_size(10)
     _setup_memory_log_xaxis(ax, x, x_full, any_full)
-    if table_cmp:
-        _model_style_legend(ax, primary_label, cmp_label, loc='upper right')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     os.makedirs(FIGURES_DIR, exist_ok=True)
@@ -1640,6 +1645,25 @@ def run_knockout_generation(tokenizer):
     items_by_name = {name: get_generation_items(name, ARGS.gen_samples, ARGS.gen_seed)
                      for name in order}
 
+    # A gated/offline dataset (e.g. GPQA without an HF token) returns no items.
+    # If a compatible cache exists we can still aggregate + plot from it with NO
+    # change to the results: `items` only ever fixes the row window nprob, and
+    # every aggregate skips uncomputed (-1) cells, so min(gen_samples, cached rows)
+    # selects exactly the same computed cells the dataset path would. Generation
+    # (which needs prompts/gold) still requires the dataset and is skipped here.
+    cache_only = {}
+    for name in order:
+        if not items_by_name[name] and os.path.exists(gen_path(name)):
+            try:
+                c0, _l0, _cns0, meta0 = load_gen(name)
+                if gen_compatible(meta0, ARGS):
+                    cache_only[name] = (min(ARGS.gen_samples, c0.shape[0]),
+                                        meta0.get('kind', name.lower()))
+                    print(f"  {name}: dataset unavailable (gated/offline) -> "
+                          f"aggregating/plotting from cache only")
+            except Exception:
+                pass
+
     # gate model load: need work if any requested cell (rows [0,nprob)) is uncomputed
     def _needs(name):
         items = items_by_name[name]
@@ -1669,9 +1693,12 @@ def run_knockout_generation(tokenizer):
     results, table = {}, {}
     for name in order:
         items = items_by_name[name]
-        if not items:
+        if items:
+            nprob, kind = len(items), items[0]['kind']
+        elif name in cache_only:
+            nprob, kind = cache_only[name]       # cache-only: identical computed cells (see above)
+        else:
             continue
-        nprob, kind = len(items), items[0]['kind']
 
         # load / initialise the correctness + length matrices, reusing cached rows
         # (stable sampling: cached row i is the same problem regardless of --gen-samples)
@@ -1697,8 +1724,13 @@ def run_knockout_generation(tokenizer):
                 lengths = np.concatenate([lengths, np.full((lengths.shape[0], 1), -1, np.int32)], axis=1)
                 cns.append(int(n))
 
-        # fill missing cells for the first nprob rows (resumable); checkpoint per batch
-        if model is not None:
+        # fill missing cells for the first nprob rows (resumable); checkpoint per batch.
+        # Generation needs the dataset (prompts + gold), so a cache-only benchmark
+        # cannot fill missing cells -- it is aggregated/plotted from what is cached.
+        if model is not None and not items:
+            print(f"  {name}: dataset unavailable -> cannot generate missing cells; "
+                  f"using cached cells only")
+        if model is not None and items:
             pad_id = getattr(tokenizer, 'pad_token_id', None)
             if pad_id is None:
                 pad_id = getattr(tokenizer, 'eos_token_id', 0) or 0

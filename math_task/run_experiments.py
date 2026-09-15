@@ -592,7 +592,7 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Final-Answer 
     ax.set_xticklabels([str(k) if k in shown else '' for k in ks] + ['std.'])
     ax.axvline(kmax + 0.8, color='0.85', lw=0.8, zorder=0)   # separates std
     ax.set_ylim(-0.02, 1.02)
-    ax.set_xlabel('Interval $k$', fontsize=LABEL_FS)
+    ax.set_xlabel('State-Emission Interval', fontsize=LABEL_FS)
     ax.set_ylabel(ylabel, fontsize=LABEL_FS)
     _style_axis(ax)
 
@@ -855,7 +855,7 @@ def plot_state_tracking_vs_k(state, name='math_state_tracking_vs_k', subdir=''):
     ax.set_xticks(ks)
     ax.set_xticklabels([str(k) if k in shown else '' for k in ks])
     ax.set_ylim(-0.02, 1.02)
-    ax.set_xlabel('Interval $k$', fontsize=LABEL_FS)
+    ax.set_xlabel('State-Emission Interval', fontsize=LABEL_FS)
     ax.set_ylabel('State accuracy', fontsize=LABEL_FS)
     _style_axis(ax)
     handles += [Line2D([], [], color='0.35', lw=1.5, marker='o', ms=4,
@@ -935,7 +935,7 @@ def plot_state_discordance_vs_k(state, name='math_state_discordance_vs_k', subdi
     ax.set_xticks(ks)
     ax.set_xlim(ks[0] - 0.3, ks[-1] + 0.3)
     ax.set_ylim(-0.02, 1.02)
-    ax.set_xlabel('Interval $k$', fontsize=LABEL_FS)
+    ax.set_xlabel('State-Emission Interval', fontsize=LABEL_FS)
     ax.set_ylabel('Drift/Recover Fraction', fontsize=LABEL_FS)
     _style_axis(ax)
     # The colour -> p mapping is carried by a shared legend across the family of

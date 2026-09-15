@@ -528,7 +528,7 @@ def plot_accuracy_bars(results, name='exploretom_accuracy', subdir=''):
         ax.axhline(b, color=COND_COLOR['base'], lw=1.1, ls=(0, (5, 3)), zorder=2)
         ax.text(len(conds) - 0.5, b + 0.015, 'not-tuned', ha='right', va='bottom',
                 fontsize=LEGEND_FS, color=COND_COLOR['base'])
-    ax.set_ylabel('Test Accuracy')
+    ax.set_ylabel('Final-Answer Accuracy')
     _style_axis(ax)
     return _save(fig, name, subdir)
 
@@ -584,7 +584,7 @@ def plot_accuracy_curve(results, name='exploretom_curve', subdir=''):
         handles['base'] = ax.axhline(base_acc, color=COND_COLOR['base'], lw=1.1,
                                      ls=(0, (5, 3)), label='not-tuned', zorder=1)
     ax.set_xlabel('Training Iterations')
-    ax.set_ylabel('Test Accuracy')
+    ax.set_ylabel('Final-Answer Accuracy')
     ax.set_ylim(0, 1)
     ax.set_xlim(left=0)
     # state-tracking first (top-left of the legend), the not-tuned line last; the
@@ -592,7 +592,7 @@ def plot_accuracy_curve(results, name='exploretom_curve', subdir=''):
     order = [c for c in (['state_tracking'] + [c for c in stats if c != 'state_tracking']
                          + ['base']) if c in handles]
     ax.legend([handles[c] for c in order], [handles[c].get_label() for c in order],
-              frameon=False, handlelength=1.5, loc='upper left', ncol=2,
+              frameon=False, handlelength=1.5, loc='lower center', ncol=2,
               columnspacing=1.0, handletextpad=0.5)
     _style_axis(ax)
     return _save(fig, name, subdir)
@@ -617,17 +617,18 @@ def print_curve(results):
 def plot_stride_sweep(stride_accs, cond_accs, name='exploretom_stride', subdir=''):
     """
     Final-answer accuracy of state_tracking vs the state-emission interval, in the
-    `math_task` accuracy-vs-k format: a line with markers over the finite
+    `math_task` accuracy-vs-k format: a plain line over the finite
     intervals; the no-interval / final-state-only case ("std.", the `STRIDE_NONE`
     sentinel) as a detached diamond one slot past the largest interval, across a
-    thin divider and joined by a dashed connector; and a **horizontal dashed
-    reference line for each fixed (interval-independent) condition** in
-    `cond_accs` -- base ("not-tuned"), direct, key_steps, narration -- at its
-    mean-over-seeds accuracy, coloured by condition and named in the legend.
-    Means over seeds with +/-1 SEM bars; `stride_accs` maps a stride to its
-    per-seed accuracies, `cond_accs` a condition to its per-seed accuracies.
+    thin divider and joined by a dashed connector; and a **horizontal reference
+    line for each fixed (interval-independent) condition** in `cond_accs` at its
+    mean-over-seeds accuracy: direct, key_steps and narration as solid,
+    colour-coded lines (identified by the shared palette), and the untuned model
+    as a dashed grey line. No legend. The sweep line and the three solid
+    reference lines each carry a +/-1 SEM shaded band over seeds (the dashed
+    untuned line does not); `stride_accs` maps a stride to its per-seed
+    accuracies, `cond_accs` a condition to its per-seed accuracies.
     """
-    from matplotlib.lines import Line2D
     _apply_style()
     strides = [s for s in STRIDE_SWEEP if stride_accs.get(s)]
     if not strides:
@@ -640,41 +641,43 @@ def plot_stride_sweep(stride_accs, cond_accs, name='exploretom_stride', subdir='
     mean = lambda v: float(np.mean(v))                                                # noqa: E731
     sem = lambda v: float(np.std(v, ddof=1) / np.sqrt(len(v))) if len(v) > 1 else 0.0  # noqa: E731
     fig, ax = plt.subplots(figsize=FIGSIZE)
-    handles = [Line2D([0], [0], color=color, lw=1.5, marker='o', ms=4,
-                      label=COND_LABEL['state_tracking'])]
-    # a horizontal dashed reference line per fixed condition, coloured by condition
-    for cond, lbl in (('base', 'not-tuned'), ('direct', COND_LABEL['direct']),
-                      ('key_steps', COND_LABEL['key_steps']),
-                      ('narration', COND_LABEL['narration'])):
+    # fixed-condition reference levels: direct/key_steps/narration as solid,
+    # colour-coded lines each with a +/-1 SEM band; the untuned model dashed (no
+    # band, no legend)
+    for cond in ('direct', 'key_steps', 'narration'):
         v = cond_accs.get(cond)
-        if not v:
-            continue
-        ax.axhline(mean(v), color=COND_COLOR[cond], lw=1.1, ls=(0, (5, 3)), zorder=1)
-        handles.append(Line2D([0], [0], color=COND_COLOR[cond], lw=1.1, ls=(0, (5, 3)), label=lbl))
+        if v:
+            m, se = mean(v), sem(v)
+            if se:
+                ax.axhspan(m - se, m + se, color=COND_COLOR[cond], alpha=BAND_ALPHA,
+                           lw=0, zorder=0)
+            ax.axhline(m, color=COND_COLOR[cond], lw=1.3, zorder=1)
+    if cond_accs.get('base'):
+        b = mean(cond_accs['base'])
+        ax.axhline(b, color=COND_COLOR['base'], lw=1.1, ls=(0, (5, 3)), zorder=1)
     xs, ys = ks, [mean(stride_accs[s]) for s in ks]
     if ks:                                               # the finite-interval sweep
-        ax.errorbar(xs, ys, yerr=[sem(stride_accs[s]) for s in ks], marker='o', ms=4.2,
-                    lw=1.5, color=color, capsize=2.5, elinewidth=0.9, zorder=3)
+        es = [sem(stride_accs[s]) for s in ks]
+        ax.fill_between(xs, [y - e for y, e in zip(ys, es)], [y + e for y, e in zip(ys, es)],
+                        color=color, alpha=BAND_ALPHA, lw=0, zorder=2)
+        ax.plot(xs, ys, lw=1.5, color=color, zorder=3)
     if has_std:                                          # the no-interval ("std.") case
-        ystd = mean(stride_accs[STRIDE_NONE])
+        ystd, estd = mean(stride_accs[STRIDE_NONE]), sem(stride_accs[STRIDE_NONE])
         if ks:
             ax.plot([xs[-1], xstd], [ys[-1], ystd], ls=(0, (3, 2)), lw=1.2, color=color, zorder=2)
         ax.axvline(kmax + 0.8, color='0.85', lw=0.8, zorder=0)   # separates std
-        ax.errorbar([xstd], [ystd], yerr=[sem(stride_accs[STRIDE_NONE])], marker='D', ms=5.5,
-                    color=color, ls='none', capsize=2.5, elinewidth=0.9, zorder=4)
+        if estd:                                         # SEM band around the detached point
+            ax.fill_between([xstd - 0.2, xstd + 0.2], ystd - estd, ystd + estd,
+                            color=color, alpha=BAND_ALPHA, lw=0, zorder=3)
+        ax.plot([xstd], [ystd], marker='D', ms=5.5, color=color, ls='none', zorder=4)
     ax.set_xticks(ks + ([xstd] if has_std else []))
     ax.set_xticklabels([str(k) for k in ks] + (['std.'] if has_std else []))
     ax.set_ylim(-0.02, 1.02)
-    ax.set_xlabel('Interval $k$', fontsize=LABEL_FS)
+    ax.set_xlabel('State-Emission Interval', fontsize=LABEL_FS)
     ax.set_ylabel('Final-Answer Accuracy', fontsize=LABEL_FS)
     ax.tick_params(labelsize=TICK_FS)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    leg = ax.legend(handles=handles, fontsize=LEGEND_FS - 1, frameon=True, loc='lower center',
-                    ncol=2, handlelength=1.6, handletextpad=0.5, columnspacing=1.1,
-                    labelspacing=0.3, borderpad=0.35, facecolor='white', edgecolor='0.8',
-                    framealpha=1.0)
-    leg.get_frame().set_linewidth(0.7)
     return _save(fig, name, subdir)
 
 
