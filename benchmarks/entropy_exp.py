@@ -23,7 +23,7 @@ def parse_args():
                                             "sweep and an entropy-vs-token-position curve.")
     p.add_argument('--experiment',
                    choices=['knockout', 'knockout-generation', 'entropy', 'all'],
-                   default='all',
+                   default='knockout-generation',
                    help="'knockout': perplexity of the ground-truth traces vs the "
                         "memory-window size n. 'knockout-generation': generate answers "
                         "under the knockout and plot accuracy vs n. 'entropy': mean "
@@ -1251,7 +1251,7 @@ def plot_knockout_results(results, n_values):
         'legend.fontsize': 7,
     })
 
-    fig, ax = plt.subplots(figsize=(3, 2.5))
+    fig, ax = plt.subplots(figsize=(3.5, 2.5))
     styles = {
         'GSM8K':    '#003366',
         'MATH-500': '#2ca02c',
@@ -1347,7 +1347,7 @@ def plot_knockout_generation_results(results, n_values, results_cmp=None,
     print("Generating Knockout-Generation Accuracy Plot...")
     plt.rcParams.update({'font.size': 12, 'axes.labelsize': 14, 'axes.titlesize': 16,
                          'xtick.labelsize': 12, 'ytick.labelsize': 12, 'legend.fontsize': 7})
-    fig, ax = plt.subplots(figsize=(3, 2.5))
+    fig, ax = plt.subplots(figsize=(3.5, 2.5))
     styles = {'GSM8K': '#003366', 'MATH-500': '#2ca02c', 'GPQA': '#d62728'}
     x = np.asarray(n_values, dtype=float)
     x_full = x.max() * 2.2           # 'full' point sits past the sweep on the log axis
@@ -1374,9 +1374,18 @@ def plot_knockout_generation_results(results, n_values, results_cmp=None,
     ax.set_ylabel("Accuracy")
     ax.set_ylim(bottom=0.0, top=1.0)
     _setup_memory_log_xaxis(ax, x, x_full, any_full)
+    # benchmark colour legend (always shown). A second ax.legend() call would
+    # replace it, so when the model style legend is also drawn we pin this one
+    # to the axes with add_artist first -- the standard two-legend idiom.
+    from matplotlib.lines import Line2D
+    bench = [Line2D([0], [0], color=c, ls='-', lw=1.8, label=disp(nm))
+             for nm, c in styles.items() if nm in results]
+    leg_bench = ax.legend(handles=bench, loc='lower right', frameon=False, handlelength=1.5,
+                          bbox_to_anchor=(1.0, -0.03))     # one character below the default corner
     if results_cmp:
+        ax.add_artist(leg_bench)
         _model_style_legend(ax, primary_label, cmp_label, loc='upper left',
-                            bbox_to_anchor=(-0.03, 1.03))  # nudged just above/left of the corner
+                            bbox_to_anchor=(0.0, 1.03))    # one character right of the earlier -0.03
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     os.makedirs(FIGURES_DIR, exist_ok=True)
@@ -1400,7 +1409,7 @@ def plot_knockout_generation_lengths(table, n_values):
     os.makedirs(FIGURES_DIR, exist_ok=True)
     for name in table:
         by_n = table[name]['by_n']
-        fig, ax = plt.subplots(figsize=(3, 2.5))
+        fig, ax = plt.subplots(figsize=(3.5, 2.5))
         any_full = False
         for key, lbl, color in series:
             mean = np.array([by_n[n][f'mean_{key}'] for n in n_values], dtype=float)
@@ -1437,7 +1446,7 @@ def plot_knockout_generation_lengths_combined(table, n_values, table_cmp=None,
     print("Generating Combined Knockout-Generation Reasoning-Length Plot...")
     plt.rcParams.update({'font.size': 12, 'axes.labelsize': 14, 'axes.titlesize': 16,
                          'xtick.labelsize': 12, 'ytick.labelsize': 12, 'legend.fontsize': 7})
-    fig, ax = plt.subplots(figsize=(3, 2.5))
+    fig, ax = plt.subplots(figsize=(3.5, 2.5))
     styles = {'GSM8K': '#003366', 'MATH-500': '#2ca02c', 'GPQA': '#d62728'}
     x = np.asarray(n_values, dtype=float)
     x_full = x.max() * 2.2           # 'full' point sits past the sweep on the log axis
