@@ -3,6 +3,7 @@ logs/
 __pycache__/
 cache/
 figures/
+entropy_traces/
 knockout_gen/
 knockout_ppl/
 *.txt

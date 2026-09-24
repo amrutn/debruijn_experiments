@@ -1,13 +1,13 @@
 """
 Averaged over random permutations pi (with the digit-sum bound as reference):
-1. Plot min paths to cover/total paths while increasing $V^n$ s.t. $n$ is fixed.
+1. Plot min paths to cover/total paths while increasing $V^c$ s.t. $n$ is fixed.
 	Include the theoretical bound from theorem 1.
 2. Plot ratio of min_length_to_cover/max_length while increasing $V^n$ s.t. $n$ is fixed.
 	Include the theoretical bound from theorem 2.
 
 Notes
 -----
-- One curve for n=2,3,4. Dotted line is the theoretical bound, dashed line is the 
+- One curve for c=2,3,4. Dotted line is the theoretical bound, dashed line is the 
 	digit-sum ordering, and the full line is for random permutations.
 - The minimum number of paths to cover every edge is computed as a min flow with a 
 	lower bound of 1 on every edge (two max flow passes). We use numba's implementation.
@@ -57,8 +57,8 @@ class DeBruijn_DAG:
 
 	The functions are:
 	1. set_random_ordering : reset the topological sort to a random sample.
-	2. node_to_val : convert a node list representation into a single number between 0, V^n.
-	3. val_to_node : convert a number between 0, V^n into the node list representation.
+	2. node_to_val : convert a node list representation into a single number between 0, V^c.
+	3. val_to_node : convert a number between 0, V^c into the node list representation.
 	4. get_incoming_nodes : returns a list of the incoming nodes to the input
 	5. get_outgoing_nodes : returns a list of the outgoing nodes to the input
 	6. get_degree : returns a tuple of the in-degree and the out-degree of the input node
@@ -960,21 +960,25 @@ def run_experiments(n_to_vrange=((2, (10, 40)), (3, (8, 30)), (4, (6, 24))),
 			# store both arithmetic (mean +/- std -> lo/hi, for a linear y-axis) and
 			# geometric (log-space, for a log y-axis) summaries of the path ratio, so
 			# either axis scale can be plotted without recomputing.
-			pr_mean, pr_std = float(np.mean(path_ratios)), float(np.std(path_ratios))
+			# shaded bands are the standard error of the mean (SEM = sample std / sqrt(n))
+			nt = len(path_ratios)
+			pr_mean = float(np.mean(path_ratios))
+			pr_sem = float(np.std(path_ratios, ddof=1)) / np.sqrt(nt) if nt > 1 else 0.0
 			logs = np.log10(np.clip(path_ratios, 1e-300, None))
 			lm, lstd = float(np.mean(logs)), float(np.std(logs))
-			lr_mean, lr_std = float(np.mean(len_ratios)), float(np.std(len_ratios))
+			lr_mean = float(np.mean(len_ratios))
+			lr_sem = float(np.std(len_ratios, ddof=1)) / np.sqrt(nt) if nt > 1 else 0.0
 			row = {
 				'V': V, 'n': n, 'm': m, 'Vn': V ** n,
 				'path_ratio_mean': pr_mean,
-				'path_ratio_lo': pr_mean - pr_std,
-				'path_ratio_hi': pr_mean + pr_std,
+				'path_ratio_lo': pr_mean - pr_sem,
+				'path_ratio_hi': pr_mean + pr_sem,
 				'path_geo_mean': 10.0 ** lm,
 				'path_geo_lo': 10.0 ** (lm - lstd),
 				'path_geo_hi': 10.0 ** (lm + lstd),
 				'len_ratio_mean': lr_mean,
-				'len_ratio_lo': lr_mean - lr_std,
-				'len_ratio_hi': lr_mean + lr_std,
+				'len_ratio_lo': lr_mean - lr_sem,
+				'len_ratio_hi': lr_mean + lr_sem,
 				'ds_path_ratio': ds['path_ratio'],
 				'ds_len_ratio': ds['len_ratio'],
 				'theory1_ratio': 10.0 ** theory1_log10_ratio(V, n, m),
@@ -982,7 +986,7 @@ def run_experiments(n_to_vrange=((2, (10, 40)), (3, (8, 30)), (4, (6, 24))),
 				'num_trials': len(path_ratios),
 			}
 			rows.append(row)
-			print(f"n={n} V={V} m={m} V^n={row['Vn']}: "
+			print(f"c={n} V={V} m={m} V^c={row['Vn']}: "
 				  f"Pmin/Ptot rand={pr_mean:.3f} ds={row['ds_path_ratio']:.2e}, "
 				  f"Lcover/Lmax rand={lr_mean:.3f} ds={row['ds_len_ratio']:.3f} "
 				  f"({row['num_trials']} trials)")
@@ -999,7 +1003,7 @@ CURVE_MARKERS = ['o', 's', '^', 'D']
 
 LABEL_FS = 14
 TICK_FS = 12
-LEGEND_FS = 7
+LEGEND_FS = 8
 
 
 def _style_axis(ax):
@@ -1008,9 +1012,9 @@ def _style_axis(ax):
 	ax.spines['right'].set_visible(False)
 
 
-# line styles: random-permutation mean (solid), digit-sum ordering (dashed),
-# theory bound (dotted). Color encodes n; style encodes which quantity.
-RANDOM_LS, DIGITSUM_LS, THEORY_LS = '-', '--', ':'
+# line styles: random-permutation mean (dotted), digit-sum ordering (dashed),
+# theory bound (solid). Color encodes n; style encodes which quantity.
+RANDOM_LS, DIGITSUM_LS, THEORY_LS = ':', '--', '-'
 
 
 def _legend(ax, keys):
@@ -1018,30 +1022,27 @@ def _legend(ax, keys):
 	# laid out as two rows above the axes
 	blank = lambda: Line2D([], [], alpha=0, label='')
 	color_handles = [Line2D([], [], color=CURVE_COLORS[i], marker=CURVE_MARKERS[i],
-							ms=3.5, lw=1.4, label=f'$n={k:g}$')
+							ls=RANDOM_LS, ms=2.2, lw=1.4, label=f'$c={k:g}$')
 					 for i, k in enumerate(keys)]
 	while len(color_handles) < 3:
 		color_handles.append(blank())
 	style_handles = [
-		Line2D([], [], color='0.35', ls=RANDOM_LS, lw=1.4, label='random'),
-		Line2D([], [], color='0.35', ls=DIGITSUM_LS, lw=1.3, label='digit-sum'),
+		Line2D([], [], color='0.35', ls=RANDOM_LS, lw=1.4, label=r'random $\pi$'),
+		Line2D([], [], color='0.35', ls=DIGITSUM_LS, lw=1.3, label=r'$\pi^*$'),
 		Line2D([], [], color='0.35', ls=THEORY_LS, lw=1.2, label='theory'),
 	]
 	# two vertical columns (column-major fill): left column = the n color key,
 	# right column = the random / digit-sum / theory style key
 	handles = color_handles + style_handles
 	leg = ax.legend(handles=handles, fontsize=LEGEND_FS, frameon=True, ncol=2,
-					loc='upper right', bbox_to_anchor=(1.0, 1.0), borderaxespad=0.15,
+					loc='lower left', bbox_to_anchor=(0.0, 0.0), borderaxespad=0.0,
 					handlelength=1.4, columnspacing=0.8, labelspacing=0.2,
 					handletextpad=0.4)
 	leg._legend_box.align = 'left'
-	# boxed and drawn opaquely in front of the curves
+	leg.get_frame().set_edgecolor('0.5')
+	leg.get_frame().set_linewidth(0.6)
+	leg.get_frame().set_alpha(0.9)
 	leg.set_zorder(20)
-	frame = leg.get_frame()
-	frame.set_edgecolor('0.7')
-	frame.set_facecolor('white')
-	frame.set_alpha(1.0)
-	frame.set_linewidth(0.7)
 
 
 def _theory_insets(ax, results, keys, ds_key, theory_key, yb=0.06):
@@ -1093,7 +1094,8 @@ def _theory_insets(ax, results, keys, ds_key, theory_key, yb=0.06):
 
 
 def _plot_ratio(results, keys, mean_key, lo_key, hi_key, ds_key, theory_key,
-				ylabel, outpath, log_y=False, show_legend=True, show_insets=False):
+				ylabel, outpath, log_y=False, show_legend=True, show_insets=False,
+				ylim_bottom=None, ylim_top=None):
 	"""
 	Plot vs V^n (log x) of three quantities per n: the random-permutation mean
 	(solid line + marker, with a shaded band from lo_key to hi_key), the digit-sum
@@ -1103,7 +1105,7 @@ def _plot_ratio(results, keys, mean_key, lo_key, hi_key, ds_key, theory_key,
 	from the top where it becomes informative). With log_y=True the y-axis is
 	logarithmic (use geometric summary keys so the band stays positive).
 	"""
-	fig, ax = plt.subplots(figsize=(3, 2.5))
+	fig, ax = plt.subplots(figsize=(4, 2.5))
 	for i, k in enumerate(keys):
 		rows = results[k]
 		x = np.array([r['Vn'] for r in rows], dtype=float)
@@ -1113,16 +1115,22 @@ def _plot_ratio(results, keys, mean_key, lo_key, hi_key, ds_key, theory_key,
 		ds = np.array([r[ds_key] for r in rows])
 		th = np.array([r[theory_key] for r in rows])
 		col = CURVE_COLORS[i]
+		if log_y:
+			lo = np.clip(lo, 1e-300, None)      # keep the band positive on a log axis
 		ax.fill_between(x, lo, hi, color=col, alpha=0.18, lw=0)
-		ax.plot(x, mu, color=col, ls=RANDOM_LS, marker=CURVE_MARKERS[i], ms=3.5, lw=1.4)
+		ax.plot(x, mu, color=col, ls=RANDOM_LS, marker=CURVE_MARKERS[i], ms=2.2, lw=1.4)
 		ax.plot(x, ds, color=col, ls=DIGITSUM_LS, lw=1.3)
 		ax.plot(x, th, color=col, ls=THEORY_LS, lw=1.2)
 	ax.set_xscale('log')
 	if log_y:
 		ax.set_yscale('log')
+		if ylim_bottom is not None:
+			ax.set_ylim(bottom=ylim_bottom)
+		if ylim_top is not None:
+			ax.set_ylim(top=ylim_top)
 	else:
 		ax.set_ylim(0, 1.08)
-	ax.set_xlabel('$V^n$', fontsize=LABEL_FS)
+	ax.set_xlabel(r'Number of Nodes ($V^c$)', fontsize=LABEL_FS)
 	ax.set_ylabel(ylabel, fontsize=LABEL_FS)
 	_style_axis(ax)
 	if show_legend:
@@ -1138,15 +1146,15 @@ def make_plots(results, outdir):
 	keys = sorted(results.keys())
 	figdir = os.path.join(outdir, 'figures')
 	os.makedirs(figdir, exist_ok=True)
-	# Plot 1: P_min / P_tot vs V^n (linear y), Theorem 1 bound + left/middle/right insets
+	# Plot 1: P_min / P_tot vs V^c (log y), with the Theorem 1 bound
 	_plot_ratio(results, keys, 'path_ratio_mean', 'path_ratio_lo', 'path_ratio_hi',
 				'ds_path_ratio', 'theory1_ratio', r'$P_{\min}/P_{\mathrm{tot}}$',
-				os.path.join(figdir, 'theorem1_path_ratio'), log_y=False,
-				show_insets=True)
-	# Plot 2: L_cover / L_max vs V^n (linear y), with the Theorem 2 bound (no legend)
+				os.path.join(figdir, 'theorem1_path_ratio'), log_y=True,
+				ylim_bottom=1e-15, ylim_top=1e0)
+	# Plot 2: L_cover / L_max vs V^c (log y), with the Theorem 2 bound (no legend)
 	_plot_ratio(results, keys, 'len_ratio_mean', 'len_ratio_lo', 'len_ratio_hi',
 				'ds_len_ratio', 'theory2_ratio', r'$L_{\mathrm{cover}}/L_{\mathrm{max}}$',
-				os.path.join(figdir, 'theorem2_length_ratio'), log_y=False,
+				os.path.join(figdir, 'theorem2_length_ratio'), log_y=True,
 				show_legend=False)
 
 
@@ -1167,6 +1175,7 @@ def main():
 		with open(cache, 'w') as f:
 			json.dump({str(c): v for c, v in results.items()}, f, indent=1)
 
+	results = {k: v for k, v in results.items() if k in (2, 3)}  # keep only c=2 and c=3
 	make_plots(results, outdir)
 	print("saved theorem1_path_ratio.{pdf,png} and theorem2_length_ratio.{pdf,png}")
 

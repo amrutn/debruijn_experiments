@@ -132,17 +132,18 @@ DATA = DataConfig(n_train=50000, n_test=1000, min_ops=3, max_ops=12)
 #
 # Reporting both separates "state in context helps" from "state in context buys
 # more gradient signal per trace".
-# A '_rec' suffix adds a short *recovery* fine-tune on top of that mode's already
-# trained adapter: RECOVERY_SAMPLES further samples, half of them carrying random
-# detours the trace solves through. It continues from the existing adapter rather
-# than training a second model, so it costs ~2% of a full run.
-BUDGET_MODES = ('samples', 'compute', 'samples_rec', 'compute_rec')
-SAMPLES_PER_COND = 40000        # 'samples' mode: traces per condition
+BUDGET_MODES = ('samples', 'compute')
+SAMPLES_PER_COND = 50000        # 'samples' mode: traces per condition
 SAMPLES_STD = 50000             # 'compute' mode: traces for the standard condition
 PASSES = 3                      # how many times the budget is swept over the pool
-RECOVERY_SAMPLES = 2000         # '_rec': extra samples of continued fine-tuning
-AUGMENT_FRAC = 0.5              # of those, the share carrying detours
-AUGMENT_P = 0.3                 # injection rate used when building them
+
+# Every experiment is repeated over these random seeds, and each seed gets its OWN
+# train/test split (train_seed = seed, test_seed = TEST_SEED0 + seed) as well as
+# its own decode seed. One adapter is trained per (condition, seed); the figures
+# show the mean over seeds with SEM error bars. Seed 0 reproduces the original
+# single-seed split (train_seed 0, test_seed 12345).
+SEEDS = (0, 1, 2)
+TEST_SEED0 = 12345
 # r=32 roughly doubles the adapter to ~2.4% of the model. The task now has 50k
 # traces behind it, so a little more capacity is cheap insurance against the
 # adapter -- rather than the data -- being the binding constraint.
@@ -154,18 +155,20 @@ MODEL = ModelConfig(lora_r=32, lora_alpha=64)
 TRAIN = TrainConfig(lr=1e-4, batch_size=8, grad_accum=4)
 
 
-def is_recovery(mode):
-    """True for modes that add a recovery fine-tune on top of the base adapter."""
-    return mode.endswith('_rec')
+def data_cfg(seed):
+    """
+    The DataConfig for one seed: its own train and test split.
+
+    `train_seed` selects the training pool and `test_seed` the held-out set, so the
+    three seeds are genuinely independent train/test draws, not just different
+    weight inits on one split. Seed 0 reproduces the original split.
+    """
+    return replace(DATA, train_seed=seed, test_seed=TEST_SEED0 + seed)
 
 
-def data_cfg(mode):
-    """The DataConfig for a mode. Only ``*_rec`` modes augment, and only during
-    their short continuation; the problems are identical either way, so the
-    dataset cache is shared with the base runs."""
-    if is_recovery(mode):
-        return replace(DATA, augment_frac=AUGMENT_FRAC, augment_p=AUGMENT_P)
-    return DATA
+def eval_cfg(seed):
+    """The EvalConfig for one seed (its own decode RNG)."""
+    return replace(EVAL, eval_seed=seed)
 
 
 def scored_ps_for(interval):
@@ -197,9 +200,9 @@ def inject_ps_for(interval):
     return [x for x in INJECT_PS if x not in STD_ONLY_PS]
 
 
-def train_cfg(interval, mode):
+def train_cfg(interval, mode, seed):
     """
-    The TrainConfig for one condition under one budget mode.
+    The TrainConfig for one condition under one budget mode, at one seed.
 
     'samples' gives every condition `SAMPLES_PER_COND` traces. 'compute' gives
     every condition the same number of *tokens* -- the budget the standard
@@ -216,16 +219,14 @@ def train_cfg(interval, mode):
     handful of tokens, so the budget would buy several times the 50k problem pool
     and the extra would be repeated passes rather than more data.
     """
-    base = mode[:-4] if is_recovery(mode) else mode
     if interval == NO_COT:
-        n = SAMPLES_PER_COND if base == 'samples' else SAMPLES_STD
-    elif base == 'samples':
+        n = SAMPLES_PER_COND if mode == 'samples' else SAMPLES_STD
+    elif mode == 'samples':
         n = SAMPLES_PER_COND
     else:
         budget = mean_tokens_per_example(None, DATA, MODEL, TRAIN) * SAMPLES_STD
         n = round(budget / mean_tokens_per_example(interval, DATA, MODEL, TRAIN))
-    tc = replace(TRAIN, total_samples=int(n) * PASSES)
-    return replace(tc, recovery_samples=RECOVERY_SAMPLES) if is_recovery(mode) else tc
+    return replace(TRAIN, total_samples=int(n) * PASSES, seed=seed)
 # max_steps must exceed the longest k=1 trace (ops + state reports + answer)
 # plus room to recover from injections; see EvalConfig.
 EVAL = EvalConfig(step_max_tokens=64, batch_size=128)
@@ -286,32 +287,37 @@ def _save(fig, name, subdir=''):
 # running
 # ----------------------------------------------------------------------------
 
-def _interval_jobs(intervals, inject_ps, device, force, progress_pos=0,
+def _interval_jobs(units, inject_ps, device, force, progress_pos=0,
                    diagnostics=False, mode='samples'):
     """
-    Train the adapter for each interval on `device` and evaluate every injection
-    probability with the model still loaded. Returns the result dicts.
+    Train and evaluate a list of ``(interval, seed)`` units on `device`.
+
+    Each unit trains its own adapter (its seed selects the train split and weight
+    init) and then evaluates every injection probability with that model still
+    loaded. Every returned result dict is tagged with both `mode` and `seed`.
     """
     out = []
-    for interval in intervals:
-        TR = train_cfg(interval, mode)
-        inject_ps = [p for p in inject_ps_for(interval) if p in set(inject_ps)]
-        todo = [p for p in inject_ps
-                if force or cached_unit(interval, p, data_cfg(mode), MODEL, TR, EVAL) is None]
-        for p in inject_ps:                                # collect the cache hits
+    for interval, seed in units:
+        dcfg, ecfg = data_cfg(seed), eval_cfg(seed)
+        TR = train_cfg(interval, mode, seed)
+        ips = [p for p in inject_ps_for(interval) if p in set(inject_ps)]
+        todo = [p for p in ips
+                if force or cached_unit(interval, p, dcfg, MODEL, TR, ecfg) is None]
+        for p in ips:                                      # collect the cache hits
             if p not in todo:
-                r = cached_unit(interval, p, data_cfg(mode), MODEL, TR, EVAL)
+                r = cached_unit(interval, p, dcfg, MODEL, TR, ecfg)
                 r['mode'] = mode
+                r['seed'] = seed
                 out.append(r)
         # no operations means no plan to replay and no states to check
-        need_diag = ([p for p in inject_ps if p > 0]
+        need_diag = ([p for p in ips if p > 0]
                      if diagnostics and interval != NO_COT else [])
         if not todo and not need_diag:
-            print(f'[{mode}] [k={interval}] all cached', flush=True)
+            print(f'[{mode}] [k={interval} seed={seed}] all cached', flush=True)
             continue
         # the model is loaded lazily: a condition whose decodes are all cached
         # never occupies the GPU at all
-        adapter = train_adapter(interval, data_cfg(mode), MODEL, TR, device=device,
+        adapter = train_adapter(interval, dcfg, MODEL, TR, device=device,
                                 force=force, log=lambda m: print(f'[{mode}] {m}', flush=True),
                                 progress_pos=progress_pos)
         _pack = {}
@@ -322,26 +328,27 @@ def _interval_jobs(intervals, inject_ps, device, force, progress_pos=0,
             return _pack['p']
 
         for p in todo:
-            res = run_unit(interval, p, data_cfg(mode), MODEL, TR, EVAL, device=device,
+            res = run_unit(interval, p, dcfg, MODEL, TR, ecfg, device=device,
                            force=force, get_model=get_model,
                            log=lambda m: print(f'[{mode}] {m}', flush=True),
                            progress_pos=progress_pos)
             res['mode'] = mode
+            res['seed'] = seed
             out.append(res)
         if diagnostics and interval != NO_COT:
             from diagnostics import run_diagnostic, diag_is_cached
-            need = [p for p in inject_ps if p > 0 and
-                    (force or not diag_is_cached(interval, p, data_cfg(mode), MODEL, TR, EVAL))]
+            need = [p for p in ips if p > 0 and
+                    (force or not diag_is_cached(interval, p, dcfg, MODEL, TR, ecfg))]
             for p in need:
                 # diagnostics are analysis, not results: never let one fail the
                 # sweep and throw away trained adapters
                 try:
-                    run_diagnostic(interval, p, data_cfg(mode), MODEL, TR, EVAL, device=device,
+                    run_diagnostic(interval, p, dcfg, MODEL, TR, ecfg, device=device,
                                    force=force, get_model=get_model,
                                    log=lambda m: print(f'[{mode}] {m}', flush=True),
                                    progress_pos=progress_pos)
                 except Exception as exc:
-                    print(f'[k={interval} p={p}] diagnostic FAILED '
+                    print(f'[k={interval} p={p} seed={seed}] diagnostic FAILED '
                           f'({type(exc).__name__}: {exc}); continuing', flush=True)
         _pack.clear()
         import torch
@@ -349,52 +356,55 @@ def _interval_jobs(intervals, inject_ps, device, force, progress_pos=0,
     return out
 
 
-_STOP = '__stop__'          # queue sentinel (None is a real interval value)
+_STOP = '__stop__'          # queue sentinel (a unit is a tuple, never this string)
 
 
 def _worker(queue, inject_ps, device, force, progress_pos, diagnostics=False,
             mode='samples'):
-    """Pull intervals off the shared queue until it is drained."""
+    """Pull ``(interval, seed)`` units off the shared queue until it is drained."""
     out = []
     while True:
-        interval = queue.get()
-        if interval == _STOP:
+        item = queue.get()
+        if item == _STOP:
             break
-        print(f'[{device}] starting {mode} k={interval}', flush=True)
-        out.extend(_interval_jobs([interval], inject_ps, device, force, progress_pos,
-                                  diagnostics, mode))
+        interval, seed = item
+        print(f'[{device}] starting {mode} k={interval} seed={seed}', flush=True)
+        out.extend(_interval_jobs([(interval, seed)], inject_ps, device, force,
+                                  progress_pos, diagnostics, mode))
     print(f'[{device}] done', flush=True)
     return out
 
 
-def run_all(intervals, inject_ps, devices, force, diagnostics=False, mode='samples'):
+def run_all(intervals, inject_ps, devices, force, diagnostics=False, mode='samples',
+            seeds=SEEDS):
     """
-    Run every (interval, inject_p) unit across `devices`.
+    Run every ``(interval, seed, inject_p)`` unit across `devices`.
 
     Work is handed out through a shared queue rather than pre-assigned, so a GPU
-    that finishes early immediately picks up the next interval instead of idling
-    while another device works through a longer queue. Each interval stays a
-    single task (train, then evaluate every injection probability with the model
-    still resident) because reloading the base model per evaluation would cost
-    more than the imbalance it saves.
+    that finishes early immediately picks up the next (interval, seed) unit instead
+    of idling. Each unit stays a single task (train, then evaluate every injection
+    probability with the model still resident) because reloading the base model per
+    evaluation would cost more than the imbalance it saves.
     """
-    # Build (and cache) the datasets here, in the parent. Every worker calls
-    # get_problems, so without this all of them would generate the same 10k
-    # problems concurrently -- minutes of duplicated SymPy work per GPU.
+    # Build (and cache) every seed's datasets here, in the parent. Each seed has its
+    # own train/test split, and every worker calls get_problems, so without this the
+    # GPUs would redo the same SymPy generation concurrently.
     t0 = time.time()
-    n_tr = len(get_problems(DATA, 'train'))
-    n_te = len(get_problems(DATA, 'test'))
-    print(f'datasets ready: {n_tr} train / {n_te} test ({time.time() - t0:.0f}s)', flush=True)
+    for seed in seeds:
+        get_problems(data_cfg(seed), 'train')
+        get_problems(data_cfg(seed), 'test')
+    print(f'datasets ready for seeds {tuple(seeds)} ({time.time() - t0:.0f}s)', flush=True)
 
+    units = [(k, seed) for seed in seeds for k in intervals]
     if len(devices) == 1:
-        return _interval_jobs(intervals, inject_ps, devices[0], force,
+        return _interval_jobs(units, inject_ps, devices[0], force,
                               diagnostics=diagnostics, mode=mode)
 
     ctx = mp.get_context('spawn')
     manager = ctx.Manager()
     queue = manager.Queue()
-    for interval in intervals:
-        queue.put(interval)
+    for unit in units:
+        queue.put(unit)
     for _ in devices:
         queue.put(_STOP)
 
@@ -413,31 +423,31 @@ def print_plan(intervals, inject_ps, devices, force, mode='samples'):
     (k, p) evaluations are missing, and how the work lands on the GPUs. Printed
     before anything loads so the cost is visible up front.
     """
-    to_train = [k for k in intervals
-                if force or not adapter_is_cached(k, data_cfg(mode), MODEL, train_cfg(k, mode))]
-    units = [(k, p) for k in intervals for p in inject_ps_for(k) if p in set(inject_ps)]
-    todo = [(k, p) for k, p in units
-            if force or cached_unit(k, p, data_cfg(mode), MODEL, train_cfg(k, mode), EVAL) is None]
-    n_tr = {k: train_cfg(k, mode).total_samples // PASSES for k in intervals}
-    n_dev, n_iv = len(devices), len(intervals)
-    per_dev = max(1, -(-n_iv // n_dev))
+    ad_units = [(k, s) for s in SEEDS for k in intervals]
+    to_train = [(k, s) for k, s in ad_units
+                if force or not adapter_is_cached(k, data_cfg(s), MODEL, train_cfg(k, mode, s))]
+    units = [(k, s, p) for s in SEEDS for k in intervals
+             for p in inject_ps_for(k) if p in set(inject_ps)]
+    todo = [(k, s, p) for k, s, p in units
+            if force or cached_unit(k, p, data_cfg(s), MODEL, train_cfg(k, mode, s),
+                                    eval_cfg(s)) is None]
+    n_tr = {k: train_cfg(k, mode, SEEDS[0]).total_samples // PASSES for k in intervals}
+    n_dev, n_units = len(devices), len(ad_units)
+    per_dev = max(1, -(-n_units // n_dev))
     print('-' * 66)
-    print(f'intervals      : {intervals}   (one LoRA each)')
+    print(f'intervals      : {intervals}   (one LoRA each, per seed)')
+    print(f'seeds          : {tuple(SEEDS)}   (own train/test split each)')
     print(f'injection probs: {inject_ps}')
     print(f'budget mode    : {mode} ({_MODE_LABEL[mode]})')
     print('traces / cond  : ' + ' '.join(
         f'{_cond_label(k)}={n_tr[k]:,}' for k in intervals))
     print(f'passes         : {PASSES}   (test set {DATA.n_test} problems)')
-    print(f'adapters       : {len(to_train)}/{len(intervals)} to train '
-          f'-> {[_cond_label(k) for k in to_train]}')
+    print(f'adapters       : {len(to_train)}/{len(ad_units)} to train '
+          f'(intervals x seeds)')
     print(f'evaluations    : {len(todo)}/{len(units)} to run')
     print(f'devices        : {devices}')
-    if n_iv < n_dev:
-        print(f'  NOTE: {n_dev - n_iv} GPU(s) will idle -- there are only {n_iv} intervals. '
-              f'Add intervals or pass fewer --devices.')
-    else:
-        print(f'  {n_iv} intervals over {n_dev} GPUs, pulled from a shared queue '
-              f'(<={per_dev} per device)')
+    print(f'  {n_units} (interval, seed) units over {n_dev} GPUs, pulled from a '
+          f'shared queue (<={per_dev} per device)')
     print(f'  per-GPU train batch {TRAIN.batch_size} x {TRAIN.grad_accum} accum '
           f'= {TRAIN.batch_size * TRAIN.grad_accum} effective; eval batch {EVAL.batch_size}')
     print('rough cost     : ~10-20 min per adapter + ~2-5 min per evaluation,')
@@ -445,18 +455,21 @@ def print_plan(intervals, inject_ps, devices, force, mode='samples'):
     print('-' * 66, flush=True)
 
 
-def load_cached(intervals, inject_ps, mode='samples'):
-    """Every cached unit for one budget mode, for --plot-only."""
+def load_cached(intervals, inject_ps, mode='samples', seeds=SEEDS):
+    """Every cached unit for one budget mode, across seeds, for --plot-only."""
     out = []
-    for interval in intervals:
-        TR = train_cfg(interval, mode)
-        for p in inject_ps_for(interval):
-            if p not in set(inject_ps):
-                continue
-            r = cached_unit(interval, p, data_cfg(mode), MODEL, TR, EVAL)
-            if r is not None:
-                r['mode'] = mode
-                out.append(r)
+    for seed in seeds:
+        dcfg, ecfg = data_cfg(seed), eval_cfg(seed)
+        for interval in intervals:
+            TR = train_cfg(interval, mode, seed)
+            for p in inject_ps_for(interval):
+                if p not in set(inject_ps):
+                    continue
+                r = cached_unit(interval, p, dcfg, MODEL, TR, ecfg)
+                if r is not None:
+                    r['mode'] = mode
+                    r['seed'] = seed
+                    out.append(r)
     return out
 
 
@@ -515,21 +528,25 @@ def _xpos(interval, kmax):
 
 def fig_subdir(mode):
     """
-    Where a mode's figures go: {with|without}_recovery/{samples|compute}_fixed.
-
-    Recovery is the outer split because it is the bigger manipulation; the budget
-    mode is the inner one. `_save` creates the nested path. Shared with
-    `length_gen` so a figure lands in the same directory however it is invoked.
+    Where a mode's figures go: ``{samples|compute}_fixed``. `_save` creates the
+    directory. Shared with `length_gen` so a figure lands in the same place however
+    it is invoked.
     """
-    return os.path.join(
-        'with_recovery' if is_recovery(mode) else 'without_recovery',
-        f'{mode[:-4] if is_recovery(mode) else mode}_fixed')
+    return f'{mode}_fixed'
 
 
 _MODE_LABEL = {'samples': 'fixed training samples',
-               'compute': 'fixed token budget',
-               'samples_rec': 'fixed training samples + recovery fine-tune',
-               'compute_rec': 'fixed token budget + recovery fine-tune'}
+               'compute': 'fixed token budget'}
+
+
+def _mean_sem(vals):
+    """Mean and standard error of the mean over `vals` (ignores None); SEM 0 if <2."""
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None, 0.0
+    m = float(np.mean(vals))
+    sem = float(np.std(vals, ddof=1) / np.sqrt(len(vals))) if len(vals) > 1 else 0.0
+    return m, sem
 
 
 def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Final-Answer Accuracy',
@@ -546,9 +563,9 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Final-Answer 
     dashed connector, so the trend is followable while the break in the x axis
     stays visible.
     """
-    # the no-CoT condition is a floor, not a point on the k axis: it is drawn as
-    # a horizontal reference so it can be read against every curve at once
-    nocot = next((r['accuracy'] for r in results if r['interval'] == NO_COT), None)
+    # Each (interval, p) has one row per seed; the curve is the mean over seeds and
+    # the error bar its SEM.
+    nocot, _ = _mean_sem([r['accuracy'] for r in results if r['interval'] == NO_COT])
     results = [r for r in results if r['interval'] != NO_COT]
     ks = sorted({r['interval'] for r in results
                  if r['interval'] is not None and r['interval'] <= PLOT_MAX_K})
@@ -556,28 +573,39 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Final-Answer 
     ps = [p for p in sorted({r['inject_p'] for r in results})
           if p not in PLOT_EXCLUDE_PS]
     colors = _inject_colors(ps)
-    fig, ax = plt.subplots(figsize=(3, 2.5))
+
+    def stat(k, p):
+        return _mean_sem([r['accuracy'] for r in results
+                          if r['interval'] == k and r['inject_p'] == p])
+
+    fig, ax = plt.subplots(figsize=(4, 2.5))
     if nocot is not None:
         # the no-reasoning floor, labelled inline. x is in data units: 1.1 puts the
         # text clear of both the spine and the k = 1 markers.
         ax.axhline(nocot, color='black', lw=1.1, ls=(0, (5, 3)), zorder=1)
-        ax.text(1.1, nocot + 0.022, 'no reasoning', fontsize=LEGEND_FS - 1,
+        ax.text(0.7, nocot + 0.015, 'no reasoning', fontsize=LEGEND_FS,
                 color='black', va='bottom')
 
     handles = []
     for p in ps:
         col = colors[p]
-        rows = {r['interval']: r for r in results if r['inject_p'] == p}
-        xs = [_xpos(k, kmax) for k in ks if k in rows]
-        ys = [rows[k]['accuracy'] for k in ks if k in rows]
+        present = [k for k in ks
+                   if any(r['interval'] == k and r['inject_p'] == p for r in results)]
+        stats = [stat(k, p) for k in present]
+        xs = [_xpos(k, kmax) for k in present]
+        ys = [m for m, _ in stats]
+        es = [e for _, e in stats]
         if xs:
-            ax.plot(xs, ys, marker='o', ms=4.2, lw=1.5, color=col, zorder=2)
-        if None in rows:                                   # standard: detached point
-            xstd, ystd = _xpos(None, kmax), rows[None]['accuracy']
+            ax.errorbar(xs, ys, yerr=es, marker='o', ms=4.2, lw=1.5, color=col,
+                        capsize=2, elinewidth=0.9, zorder=2)
+        if any(r['interval'] is None and r['inject_p'] == p for r in results):
+            xstd = _xpos(None, kmax)
+            ystd, estd = stat(None, p)                      # standard: detached point
             if xs:
                 ax.plot([xs[-1], xstd], [ys[-1], ystd], ls=(0, (3, 2)), lw=1.2,
                         color=col, zorder=1)
-            ax.plot([xstd], [ystd], marker='D', ms=5.5, color=col, ls='none', zorder=3)
+            ax.errorbar([xstd], [ystd], yerr=[estd], marker='D', ms=5.5, color=col,
+                        ls='none', capsize=2, elinewidth=0.9, zorder=3)
         # a probability evaluated only at standard has no curve, so show its
         # marker alone rather than a line the figure never draws
         handles.append(Line2D([], [], color=col, marker='o', ms=4, lw=1.5,
@@ -589,7 +617,7 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Final-Answer 
     # other one (always keeping the first and last) plus the standard point
     shown = set(ks[::2]) | {ks[0], ks[-1]} if ks else set()
     ax.set_xticks(ks + [_xpos(None, kmax)])
-    ax.set_xticklabels([str(k) if k in shown else '' for k in ks] + ['std.'])
+    ax.set_xticklabels([str(k) if k in shown else '' for k in ks] + [r'$\infty$'])
     ax.axvline(kmax + 0.8, color='0.85', lw=0.8, zorder=0)   # separates std
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel('State-Emission Interval', fontsize=LABEL_FS)
@@ -599,12 +627,12 @@ def plot_accuracy_vs_k(results, name='math_accuracy_vs_k', ylabel='Final-Answer 
     # two columns: six entries stacked vertically reach down into the curves,
     # whereas the strip above y~0.7 is empty for all but the smallest k
     if legend:
-        leg = ax.legend(handles=handles, title='Perturbation Probability', fontsize=LEGEND_FS - 1,
-                        title_fontsize=LEGEND_FS - 1, frameon=True, loc='upper right',
-                        ncol=2, handlelength=1.2, handletextpad=0.4,
-                        labelspacing=0.25, columnspacing=1.0, borderaxespad=0.2,
-                        facecolor='white', edgecolor='0.8', framealpha=1.0,
-                        borderpad=0.35)
+        leg = ax.legend(handles=handles, title='Perturbation Probability', fontsize=LEGEND_FS,
+                        title_fontsize=LEGEND_FS, frameon=True, loc='upper right',
+                        bbox_to_anchor=(1.02, 1.04), ncol=2, handlelength=1.2,
+                        handletextpad=0.4, labelspacing=0.25, columnspacing=1.0,
+                        borderaxespad=0.0, facecolor='white', edgecolor='0.8',
+                        framealpha=1.0, borderpad=0.35)
         leg.get_frame().set_linewidth(0.7)
         leg.set_zorder(10)
         leg._legend_box.align = 'left'
@@ -615,7 +643,7 @@ STATE_CACHE = os.path.join(CACHE, 'state')
 ORDER_CACHE = os.path.join(CACHE, 'order')
 
 
-def order_results(mode, force=False, pass_label=''):
+def order_results(mode, force=False, pass_label='', seeds=SEEDS):
     """
     On the CLEAN decodes, how closely do correct traces follow the canonical order?
 
@@ -639,20 +667,22 @@ def order_results(mode, force=False, pass_label=''):
 
     A re-scoring of cached decodes; no GPU.
     """
-    problems = get_problems(DATA, 'test')
-    ks = list(INTERVALS)
+    units = [(s, k) for s in seeds for k in INTERVALS]
     prefix_lbl = f'[{pass_label}] ' if pass_label else ''
-    bar = tqdm(ks, desc=f'{prefix_lbl}{mode} order re-score', leave=False,
+    bar = tqdm(units, desc=f'{prefix_lbl}{mode} order re-score', leave=False,
                dynamic_ncols=True, mininterval=2.0)
     out = []
-    for k in bar:
-        TR = train_cfg(k, mode)
-        dec = _decode_path(k, 0.0, data_cfg(mode), MODEL, TR, EVAL)
+    probs_by_seed = {}
+    for s, k in bar:
+        dcfg, ecfg = data_cfg(s), eval_cfg(s)
+        TR = train_cfg(k, mode, s)
+        problems = probs_by_seed.setdefault(s, get_problems(dcfg, 'test'))
+        dec = _decode_path(k, 0.0, dcfg, MODEL, TR, ecfg)
         if not os.path.exists(dec):
             continue
-        spec = dict(task='math-order', interval=k, mode=mode,
-                    data=_data_spec(data_cfg(mode)), model=MODEL.__dict__,
-                    train=_train_spec(TR), eval=EVAL.__dict__)
+        spec = dict(task='math-order', interval=k, mode=mode, seed=s,
+                    data=_data_spec(dcfg), model=MODEL.__dict__,
+                    train=_train_spec(TR), eval=ecfg.__dict__)
         path = os.path.join(ORDER_CACHE, _key(spec) + '.json')
         if os.path.exists(path) and not force:
             with open(path) as f:
@@ -674,7 +704,7 @@ def order_results(mode, force=False, pass_label=''):
             pref += got[:m] == want[:m]
             lcs_sum += _lcs_len(got, want) / max(len(want), 1)
             len_sum += len(got) / max(len(want), 1)
-        row = dict(interval=k, mode=mode, n_correct=n,
+        row = dict(interval=k, mode=mode, seed=s, n_correct=n,
                    exact=(exact / n) if n else None,
                    prefix=(pref / n) if n else None,
                    lcs=(lcs_sum / n) if n else None,
@@ -703,28 +733,35 @@ def _lcs_len(a, b):
 
 
 def print_order(order, mode=None):
-    """Canonical-order adherence among correct traces on the clean decodes."""
+    """Canonical-order adherence among correct traces, averaged over seeds."""
     rows = [r for r in order if r.get('exact') is not None]
     if not rows:
         return
     head = 'canonical-order adherence, CLEAN decodes, correct traces only'
     if mode:
         head += f'   [{_MODE_LABEL.get(mode, mode)}]'
-    print('\n' + head)
+    print('\n' + head + '   (mean over seeds)')
     print('  exact     the operation list equals the canonical one')
     print('  prefix    same order as far as the shorter of the two runs')
     print('  lcs       mean longest-common-subsequence ratio (partial credit)')
     print('  len       mean operations emitted / canonical operations')
     print()
     print('  cond   n_correct    exact   prefix      lcs      len')
-    for r in sorted(rows, key=lambda r: (99 if r['interval'] is None else r['interval'])):
-        print(f'  {_cond_label(r["interval"]):>4}   {r["n_correct"]:>9}   '
-              f'{r["exact"]:6.3f}   {r["prefix"]:6.3f}   {r["lcs"]:6.3f}   '
-              f'{r["len_ratio"]:6.3f}')
+    ks = sorted({r['interval'] for r in rows},
+                key=lambda k: (99 if k is None else k))
+    for k in ks:
+        rs = [r for r in rows if r['interval'] == k]
+        n = int(round(np.mean([r['n_correct'] for r in rs])))
+        exact, _ = _mean_sem([r['exact'] for r in rs])
+        pref, _ = _mean_sem([r['prefix'] for r in rs])
+        lcs, _ = _mean_sem([r['lcs'] for r in rs])
+        lr, _ = _mean_sem([r['len_ratio'] for r in rs])
+        print(f'  {_cond_label(k):>4}   {n:>9}   '
+              f'{exact:6.3f}   {pref:6.3f}   {lcs:6.3f}   {lr:6.3f}')
 
 
 
-def state_results(mode, force=False, pass_label=''):
+def state_results(mode, force=False, pass_label='', seeds=SEEDS):
     """
     Anchored and cumulative state accuracy per condition and injection probability.
 
@@ -739,21 +776,23 @@ def state_results(mode, force=False, pass_label=''):
     """
     from diagnostics import state_tracking
 
-    problems = get_problems(DATA, 'test')
-    units = [(k, pp) for k in INTERVALS if k is not None
+    units = [(s, k, pp) for s in seeds for k in INTERVALS if k is not None
              for pp in scored_ps_for(k)]
     prefix = f'[{pass_label}] ' if pass_label else ''
     bar = tqdm(units, desc=f'{prefix}{mode} state re-score', leave=False,
                dynamic_ncols=True, mininterval=2.0)
     out = []
-    for k, pp in bar:
-        TR = train_cfg(k, mode)
-        dec = _decode_path(k, pp, data_cfg(mode), MODEL, TR, EVAL)
+    probs_by_seed = {}
+    for s, k, pp in bar:
+        dcfg, ecfg = data_cfg(s), eval_cfg(s)
+        TR = train_cfg(k, mode, s)
+        problems = probs_by_seed.setdefault(s, get_problems(dcfg, 'test'))
+        dec = _decode_path(k, pp, dcfg, MODEL, TR, ecfg)
         if not os.path.exists(dec):
             continue
-        spec = dict(task='math-state', interval=k, mode=mode,
-                    data=_data_spec(data_cfg(mode)), model=MODEL.__dict__,
-                    train=_train_spec(TR), eval=EVAL.__dict__)
+        spec = dict(task='math-state', interval=k, mode=mode, seed=s,
+                    data=_data_spec(dcfg), model=MODEL.__dict__,
+                    train=_train_spec(TR), eval=ecfg.__dict__)
         # keep the clean entries already on disk valid: they were keyed without
         # an injection probability, which is what p = 0 meant
         if pp > 0:
@@ -776,7 +815,7 @@ def state_results(mode, force=False, pass_label=''):
                 continue
             tot += a; ok += b_; skip += sk; cum += c; cum_ok += d
             cum_only += co; anch_only += ao
-        row = dict(interval=k, inject_p=pp, mode=mode,
+        row = dict(interval=k, inject_p=pp, mode=mode, seed=s,
                    anchored=(ok / tot) if tot else None,
                    cumulative=(cum_ok / cum) if cum else None,
                    n_reports=tot, n_unscorable=skip,
@@ -829,26 +868,36 @@ def plot_state_tracking_vs_k(state, name='math_state_tracking_vs_k', subdir=''):
     the reference models already show the signature the test is meant to detect. The
     prediction is not sound and is no longer drawn.
     """
-    rows = {(d['interval'], d.get('inject_p') or 0.0): d for d in state
+    # one row per (interval, p, seed); aggregate to mean +/- SEM over seeds
+    rows = [d for d in state
             if d.get('anchored') is not None and d.get('cumulative') is not None
-            and d['interval'] <= PLOT_MAX_K}
+            and d['interval'] <= PLOT_MAX_K]
     if not rows:
         return None
-    ks = sorted({k for k, _ in rows})
-    ps = [pp for pp in sorted({pp for _, pp in rows}) if pp not in PLOT_EXCLUDE_PS]
+    ks = sorted({d['interval'] for d in rows})
+    ps = [pp for pp in sorted({d.get('inject_p') or 0.0 for d in rows})
+          if pp not in PLOT_EXCLUDE_PS]
     colors = _inject_colors(ps)
 
-    fig, ax = plt.subplots(figsize=(3, 2.5))
+    def stat(k, pp, field):
+        return _mean_sem([d[field] for d in rows if d['interval'] == k
+                          and (d.get('inject_p') or 0.0) == pp])
+
+    fig, ax = plt.subplots(figsize=(4, 2.5))
     handles = []
     for pp in ps:
         col = colors[pp]
-        xs = [k for k in ks if (k, pp) in rows]
+        xs = [k for k in ks if any(d['interval'] == k
+              and (d.get('inject_p') or 0.0) == pp for d in rows)]
         if not xs:
             continue
-        ax.plot(xs, [rows[(k, pp)]['anchored'] for k in xs], marker='o', ms=4.0,
-                lw=1.5, color=col, zorder=2)
-        ax.plot(xs, [rows[(k, pp)]['cumulative'] for k in xs], ls=(0, (3, 2)),
-                marker='D', ms=3.6, lw=1.3, color=col, zorder=2)
+        am = [stat(k, pp, 'anchored') for k in xs]
+        cm = [stat(k, pp, 'cumulative') for k in xs]
+        ax.errorbar(xs, [m for m, _ in am], yerr=[e for _, e in am], marker='o',
+                    ms=4.0, lw=1.5, color=col, capsize=2, elinewidth=0.9, zorder=2)
+        ax.errorbar(xs, [m for m, _ in cm], yerr=[e for _, e in cm], ls=(0, (3, 2)),
+                    marker='D', ms=3.6, lw=1.3, color=col, capsize=2, elinewidth=0.9,
+                    zorder=2)
         handles.append(Line2D([], [], color=col, marker='o', ms=4, lw=1.5,
                               label=rf'$p={pp:g}$'))
     shown = set(ks[::2]) | {ks[0], ks[-1]}
@@ -862,7 +911,7 @@ def plot_state_tracking_vs_k(state, name='math_state_tracking_vs_k', subdir=''):
                        label='anchored'),
                 Line2D([], [], color='0.35', lw=1.3, ls=(0, (3, 2)), marker='D',
                        ms=3.6, label='cumulative')]
-    leg = ax.legend(handles=handles, fontsize=LEGEND_FS - 1, frameon=True,
+    leg = ax.legend(handles=handles, fontsize=LEGEND_FS, frameon=True,
                     loc='upper right', ncol=2, handlelength=1.4, handletextpad=0.5,
                     labelspacing=0.25, columnspacing=1.0, borderaxespad=0.2,
                     facecolor='white', edgecolor='0.8', framealpha=1.0,
@@ -902,9 +951,10 @@ def plot_state_discordance_vs_k(state, name='math_state_discordance_vs_k', subdi
         Colours are taken from the full injection ramp either way, so a p keeps the
         same colour it has in the state accuracy figure whichever subset is drawn.
     """
-    rows = {(d['interval'], d.get('inject_p') or 0.0): d for d in state
+    # one row per (interval, p, seed); the split is computed per seed then averaged
+    rows = [d for d in state
             if d.get('cum_only') is not None and d.get('anch_only') is not None
-            and 1 <= d['interval'] <= 5}
+            and 1 <= d['interval'] <= 5]
     if not rows:
         return None
 
@@ -913,25 +963,32 @@ def plot_state_discordance_vs_k(state, name='math_state_discordance_vs_k', subdi
         denom = d['anch_only'] + d['cum_only']
         return d[field] / denom if denom else None
 
-    ks = sorted({k for k, _ in rows})
+    ks = sorted({d['interval'] for d in rows})
     # colour from the full injection grid so each p keeps the colour it has in the
     # state accuracy figure, whether we draw all of them or only a subset.
-    all_ps = [pp for pp in sorted({pp for _, pp in rows}) if pp not in PLOT_EXCLUDE_PS]
+    all_ps = [pp for pp in sorted({d.get('inject_p') or 0.0 for d in rows})
+              if pp not in PLOT_EXCLUDE_PS]
     colors = _inject_colors(all_ps)
     ps = all_ps if ps_shown is None else [pp for pp in ps_shown if pp in all_ps]
 
-    fig, ax = plt.subplots(figsize=(3, 2.5))
+    def stat(k, pp, field):
+        return _mean_sem([frac(d, field) for d in rows if d['interval'] == k
+                          and (d.get('inject_p') or 0.0) == pp])
+
+    fig, ax = plt.subplots(figsize=(4, 2.5))
     for pp in ps:
         col = colors[pp]
-        # only k with at least one discordant report have a defined split
-        xs = [k for k in ks if (k, pp) in rows
-              and frac(rows[(k, pp)], 'anch_only') is not None]
+        # only k with at least one discordant report (some seed) have a split
+        xs = [k for k in ks if stat(k, pp, 'anch_only')[0] is not None]
         if not xs:
             continue
-        ax.plot(xs, [frac(rows[(k, pp)], 'anch_only') for k in xs], marker='o',
-                ms=4.0, lw=1.5, color=col, zorder=2)
-        ax.plot(xs, [frac(rows[(k, pp)], 'cum_only') for k in xs], ls=(0, (3, 2)),
-                marker='D', ms=3.6, lw=1.3, color=col, zorder=2)
+        dm = [stat(k, pp, 'anch_only') for k in xs]
+        rm = [stat(k, pp, 'cum_only') for k in xs]
+        ax.errorbar(xs, [m for m, _ in dm], yerr=[e for _, e in dm], marker='o',
+                    ms=4.0, lw=1.5, color=col, capsize=2, elinewidth=0.9, zorder=2)
+        ax.errorbar(xs, [m for m, _ in rm], yerr=[e for _, e in rm], ls=(0, (3, 2)),
+                    marker='D', ms=3.6, lw=1.3, color=col, capsize=2, elinewidth=0.9,
+                    zorder=2)
     ax.set_xticks(ks)
     ax.set_xlim(ks[0] - 0.3, ks[-1] + 0.3)
     ax.set_ylim(-0.02, 1.02)
@@ -945,7 +1002,7 @@ def plot_state_discordance_vs_k(state, name='math_state_discordance_vs_k', subdi
                       label='drift'),
                Line2D([], [], color='0.35', lw=1.3, ls=(0, (3, 2)), marker='D',
                       ms=3.6, label='recover')]
-    leg = ax.legend(handles=handles, fontsize=LEGEND_FS - 1, frameon=True,
+    leg = ax.legend(handles=handles, fontsize=LEGEND_FS, frameon=True,
                     loc='center left', handlelength=1.4, handletextpad=0.5,
                     labelspacing=0.25, borderaxespad=0.4, facecolor='white',
                     edgecolor='0.8', framealpha=1.0, borderpad=0.35)
@@ -981,11 +1038,17 @@ def mcnemar(cum_only, anch_only):
 
 
 def print_state_tracking(state, results=None):
-    """The two state-tracking scores side by side, with the sign of their gap."""
-    rows = {d['interval']: d for d in state if d.get('cumulative') is not None
-            and not d.get('inject_p')}
-    if not rows:
+    """
+    The two state-tracking scores side by side, with the sign of their gap.
+
+    Anchored/cumulative are averaged over seeds; the discordant counts are pooled
+    across seeds before the McNemar test (it is a count-based paired test).
+    """
+    clean = [d for d in state if d.get('cumulative') is not None
+             and not d.get('inject_p')]
+    if not clean:
         return
+    ks = sorted({d['interval'] for d in clean})
     print('\nstate tracking on the CLEAN decode (no injection), raw per report')
     print('  anchored   : truth re-adopts the model\'s claim after every report')
     print('  cumulative : truth is the consequence of the operations written so far')
@@ -1002,15 +1065,13 @@ def print_state_tracking(state, results=None):
     print()
     print('  cond   anchored   cumulative      gap   cum-only  anch-only'
           '   n_disc        p   reading')
-    for k in sorted(rows):
-        r = rows[k]
-        a, c = r['anchored'], r['cumulative']
-        co, ao = r.get('cum_only'), r.get('anch_only')
+    for k in ks:
+        ds = [d for d in clean if d['interval'] == k]
+        a, _ = _mean_sem([d['anchored'] for d in ds])
+        c, _ = _mean_sem([d['cumulative'] for d in ds])
+        co = sum(d.get('cum_only') or 0 for d in ds)      # pooled over seeds
+        ao = sum(d.get('anch_only') or 0 for d in ds)
         tag = 'recovers' if c > a else ('drifts' if c < a else '-')
-        if co is None:
-            print(f'  {k:>4}     {a:.3f}        {c:.3f}   {c - a:+.3f}'
-                  f'         -          -        -        -   {tag}')
-            continue
         n, pv = mcnemar(co, ao)
         star = '' if pv is None else (
             '***' if pv < 1e-3 else '**' if pv < 0.01 else '*' if pv < 0.05 else 'ns')
@@ -1019,8 +1080,8 @@ def print_state_tracking(state, results=None):
               f'   {n:>6}  {ps} {star:<3} {tag}')
     print()
     print('  * p<0.05   ** p<0.01   *** p<0.001   ns = not significant')
-    std = next((r['accuracy'] for r in (results or [])
-                if r['interval'] is None and r['inject_p'] == 0.0), None)
+    std, _ = _mean_sem([r['accuracy'] for r in (results or [])
+                        if r['interval'] is None and r['inject_p'] == 0.0])
     if std is not None:
         print(f'  {"std":>4}     {std:.3f}        {std:.3f}    0.000   '
               'final state only (test accuracy)')
@@ -1029,7 +1090,7 @@ def print_state_tracking(state, results=None):
 DERIV_CACHE = os.path.join(CACHE, 'derivation')
 
 
-def derivation_results(mode, force=False, variant='full', pass_label=''):
+def derivation_results(mode, force=False, variant='full', pass_label='', seeds=SEEDS):
     """
     Derivation accuracy for every (k, p) whose decode is cached.
 
@@ -1069,88 +1130,95 @@ def derivation_results(mode, force=False, variant='full', pass_label=''):
     labelling them ``[3/8]`` makes clear that the bar restarting is the next pass
     rather than the same work repeating.
     """
-    problems = get_problems(DATA, 'test')
-    units = [(k, p) for k in INTERVALS for p in scored_ps_for(k)]
+    units = [(s, k, p) for s in seeds for k in INTERVALS for p in scored_ps_for(k)]
     label = {'full': 'derivation', 'ignored': 'ignored',
              'replaced': 'replaced'}[variant]
     prefix = f'[{pass_label}] ' if pass_label else ''
     bar = tqdm(units, desc=f'{prefix}{mode} {label} re-score', leave=False,
                dynamic_ncols=True, mininterval=2.0)
     out = []
-    for k, p in bar:
-        if True:
-            TR = train_cfg(k, mode)
-            dec = _decode_path(k, p, data_cfg(mode), MODEL, TR, EVAL)
-            if not os.path.exists(dec):
-                continue
-            spec = dict(task='math-deriv', interval=k, inject_p=p, mode=mode,
-                        data=_data_spec(data_cfg(mode)), model=MODEL.__dict__,
-                        train=_train_spec(TR), eval=EVAL.__dict__)
-            # spelled so that the keys already on disk keep their meaning:
-            # 'full' adds nothing, 'ignored' keeps the original flag name
-            if variant == 'ignored':
-                spec['ignore_injected'] = True
-            elif variant != 'full':
-                spec['variant'] = variant
-            path = os.path.join(DERIV_CACHE, _key(spec) + '.json')
-            if os.path.exists(path) and not force:
-                with open(path) as f:
-                    out.append(json.load(f))
-                continue
-            with open(dec) as f:
-                records = json.load(f)['records']
-            n_ok = 0
-            for prob, rec in zip(problems, records):
-                steps = [x for x in rec if x['kind'] == 'op']
-                ans_step = next((x['text'] for x in rec if x['kind'] == 'answer'), '')
-                claimed = parse_answers(ans_step)
-                if variant == 'replaced':
-                    ok = derivation_correct_replaced(
-                        prob, [x['text'] for x in steps],
-                        [x['injected'] for x in steps], claimed)
-                else:
-                    ops = [x['text'] for x in steps
-                           if not (variant == 'ignored' and x['injected'])]
-                    ok = derivation_correct(prob, ops, claimed)
-                n_ok += bool(ok)
-            row = dict(interval=k, inject_p=p, mode=mode, variant=variant,
-                       accuracy=n_ok / max(len(problems), 1), n_eval=len(problems))
-            os.makedirs(DERIV_CACHE, exist_ok=True)
-            tmp = path + f'.tmp{os.getpid()}'
-            with open(tmp, 'w') as f:
-                json.dump(row, f)
-            os.replace(tmp, path)
-            out.append(row)
+    probs_by_seed = {}
+    for s, k, p in bar:
+        dcfg, ecfg = data_cfg(s), eval_cfg(s)
+        TR = train_cfg(k, mode, s)
+        problems = probs_by_seed.setdefault(s, get_problems(dcfg, 'test'))
+        dec = _decode_path(k, p, dcfg, MODEL, TR, ecfg)
+        if not os.path.exists(dec):
+            continue
+        spec = dict(task='math-deriv', interval=k, inject_p=p, mode=mode,
+                    data=_data_spec(dcfg), model=MODEL.__dict__,
+                    train=_train_spec(TR), eval=ecfg.__dict__)
+        # spelled so that the keys already on disk keep their meaning:
+        # 'full' adds nothing, 'ignored' keeps the original flag name
+        if variant == 'ignored':
+            spec['ignore_injected'] = True
+        elif variant != 'full':
+            spec['variant'] = variant
+        path = os.path.join(DERIV_CACHE, _key(spec) + '.json')
+        if os.path.exists(path) and not force:
+            with open(path) as f:
+                out.append(json.load(f))
+            continue
+        with open(dec) as f:
+            records = json.load(f)['records']
+        n_ok = 0
+        for prob, rec in zip(problems, records):
+            steps = [x for x in rec if x['kind'] == 'op']
+            ans_step = next((x['text'] for x in rec if x['kind'] == 'answer'), '')
+            claimed = parse_answers(ans_step)
+            if variant == 'replaced':
+                ok = derivation_correct_replaced(
+                    prob, [x['text'] for x in steps],
+                    [x['injected'] for x in steps], claimed)
+            else:
+                ops = [x['text'] for x in steps
+                       if not (variant == 'ignored' and x['injected'])]
+                ok = derivation_correct(prob, ops, claimed)
+            n_ok += bool(ok)
+        row = dict(interval=k, inject_p=p, mode=mode, seed=s, variant=variant,
+                   accuracy=n_ok / max(len(problems), 1), n_eval=len(problems))
+        os.makedirs(DERIV_CACHE, exist_ok=True)
+        tmp = path + f'.tmp{os.getpid()}'
+        with open(tmp, 'w') as f:
+            json.dump(row, f)
+        os.replace(tmp, path)
+        out.append(row)
     bar.close()
     return out
 
 
 def print_summary(results, mode=None, label='accuracy'):
-    """Metric table: rows are conditions, columns injection probabilities."""
-    nocot = next((r for r in results if r['interval'] == NO_COT), None)
+    """Metric table (mean over seeds): rows conditions, cols injection probability."""
+    nocot_rows = [r for r in results if r['interval'] == NO_COT]
     results = [r for r in results if r['interval'] != NO_COT]
     ks = sorted({r['interval'] for r in results if r['interval'] is not None})
     ps = sorted({r['inject_p'] for r in results})
     order = ks + ([None] if any(r['interval'] is None for r in results) else [])
-    idx = {(r['interval'], r['inject_p']): r for r in results}
+
+    def cell_mean(k, p):
+        m, _ = _mean_sem([r['accuracy'] for r in results
+                          if r['interval'] == k and r['inject_p'] == p])
+        return m
+
     head = f'{label} (rows: state-emission interval, cols: injection probability)'
     if mode:
         head += f'   [{_MODE_LABEL.get(mode, mode)}]'
-    print('\n' + head)
+    print('\n' + head + f'   (mean over {len(SEEDS)} seeds)')
     print('  cond  ' + '   n_train'
           + '  '.join((f'p={p:g}').rjust(8) for p in ps))
     for k in order:
         cells = []
         for p in ps:
-            r = idx.get((k, p))
-            cells.append((f'{r["accuracy"]:.3f}' if r else '-').rjust(8))
-        n = train_cfg(k, mode).total_samples // PASSES if mode else 0
+            m = cell_mean(k, p)
+            cells.append((f'{m:.3f}' if m is not None else '-').rjust(8))
+        n = train_cfg(k, mode, SEEDS[0]).total_samples // PASSES if mode else 0
         ncol = f'{n:>8,}  ' if mode else ''
         print(f'  {_cond_label(k):<4}  {ncol}' + '  '.join(cells))
-    if nocot is not None:
-        n = train_cfg(NO_COT, mode).total_samples // PASSES if mode else 0
+    if nocot_rows:
+        nocot, _ = _mean_sem([r['accuracy'] for r in nocot_rows])
+        n = train_cfg(NO_COT, mode, SEEDS[0]).total_samples // PASSES if mode else 0
         print(f'  {"none":<4}  ' + (f'{n:>8,}  ' if mode else '')
-              + f'{nocot["accuracy"]:.3f}'.rjust(8)
+              + f'{nocot:.3f}'.rjust(8)
               + '   <- no reasoning emitted; injection does not apply')
 
 
@@ -1209,7 +1277,12 @@ def main():
 
         results = [r for r in results if r is not None]
         sub = fig_subdir(mode)
-        path = plot_accuracy_vs_k(results, name=f'math_accuracy_vs_k_{mode}', subdir=sub)
+        # carry the legend on exactly one of the accuracy / derivation twins per
+        # mode, so the pair shares one key: final-answer holds it for 'samples',
+        # derivation holds it for 'compute'.
+        acc_legend = (mode != 'compute')
+        path = plot_accuracy_vs_k(results, name=f'math_accuracy_vs_k_{mode}', subdir=sub,
+                                  legend=acc_legend)
         print(f'\nwrote {path}.pdf/.png')
         print_summary(results, mode)
 
@@ -1219,7 +1292,7 @@ def main():
         if deriv:
             dpath = plot_accuracy_vs_k(deriv, name=f'math_derivation_vs_k_{mode}',
                                        ylabel='Derivation accuracy', subdir=sub,
-                                       legend=False)
+                                       legend=not acc_legend)
             print(f'wrote {dpath}.pdf/.png')
             print_summary(deriv, mode, label='derivation accuracy (step sequence only)')
 
@@ -1285,18 +1358,21 @@ def main():
 
         if args.diagnostics or args.plot_only:
             from diagnostics import run_diagnostic, print_diagnostics, _diag_path
-            # Every unit is re-read here for reporting. Entries written before a
-            # field existed are recomputed rather than the cache key being bumped,
-            # so this can be minutes of symbolic replay with no GPU involved --
-            # hence a bar, since a silent stall looks like a hang.
+            # Diagnostics are an optional deep-dive, not a figure, so they are
+            # reported for the first seed only rather than aggregated. Every unit is
+            # re-read here; entries written before a field existed are recomputed
+            # rather than bumping the cache key, so this can be minutes of symbolic
+            # replay with no GPU -- hence a bar, since a silent stall looks like a hang.
+            s0 = SEEDS[0]
+            dcfg0, ecfg0 = data_cfg(s0), eval_cfg(s0)
             units = [(k, p) for k in INTERVALS for p in scored_ps_for(k)
                      if p > 0 and os.path.exists(
-                         _diag_path(k, p, data_cfg(mode), MODEL, train_cfg(k, mode), EVAL))]
+                         _diag_path(k, p, dcfg0, MODEL, train_cfg(k, mode, s0), ecfg0))]
             diag = []
             for k, p in tqdm(units, desc=f'{mode} diagnostics', leave=False,
                              dynamic_ncols=True, mininterval=2.0):
-                diag.append(run_diagnostic(k, p, data_cfg(mode), MODEL,
-                                           train_cfg(k, mode), EVAL))
+                diag.append(run_diagnostic(k, p, dcfg0, MODEL,
+                                           train_cfg(k, mode, s0), ecfg0))
             if diag:
                 print_diagnostics(diag)
                 for d in diag:

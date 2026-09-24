@@ -219,10 +219,10 @@ class Setup:
 # grid and no titles)
 # ----------------------------------------------------------------------------
 
-FIGSIZE = (3, 2.5)
+FIGSIZE = (4, 2.5)
 LABEL_FS = 14
 TICK_FS = 12
-LEGEND_FS = 7
+LEGEND_FS = 8
 LINE_LW = 1.8
 BAND_ALPHA = 0.3
 
@@ -617,10 +617,8 @@ def print_curve(results):
 def plot_stride_sweep(stride_accs, cond_accs, name='exploretom_stride', subdir=''):
     """
     Final-answer accuracy of state_tracking vs the state-emission interval, in the
-    `math_task` accuracy-vs-k format: a plain line over the finite
-    intervals; the no-interval / final-state-only case ("std.", the `STRIDE_NONE`
-    sentinel) as a detached diamond one slot past the largest interval, across a
-    thin divider and joined by a dashed connector; and a **horizontal reference
+    `math_task` accuracy-vs-k format: a plain line over the finite intervals; and
+    a **horizontal reference
     line for each fixed (interval-independent) condition** in `cond_accs` at its
     mean-over-seeds accuracy: direct, key_steps and narration as solid,
     colour-coded lines (identified by the shared palette), and the untuned model
@@ -630,13 +628,9 @@ def plot_stride_sweep(stride_accs, cond_accs, name='exploretom_stride', subdir='
     accuracies, `cond_accs` a condition to its per-seed accuracies.
     """
     _apply_style()
-    strides = [s for s in STRIDE_SWEEP if stride_accs.get(s)]
-    if not strides:
+    ks = [s for s in STRIDE_SWEEP if s != STRIDE_NONE and stride_accs.get(s)]
+    if not ks:
         return None
-    ks = [s for s in strides if s != STRIDE_NONE]
-    kmax = max(ks) if ks else 1
-    has_std = STRIDE_NONE in strides
-    xstd = kmax + 1.6                                     # std sits one slot right of kmax
     color = COND_COLOR['state_tracking']
     mean = lambda v: float(np.mean(v))                                                # noqa: E731
     sem = lambda v: float(np.std(v, ddof=1) / np.sqrt(len(v))) if len(v) > 1 else 0.0  # noqa: E731
@@ -661,17 +655,8 @@ def plot_stride_sweep(stride_accs, cond_accs, name='exploretom_stride', subdir='
         ax.fill_between(xs, [y - e for y, e in zip(ys, es)], [y + e for y, e in zip(ys, es)],
                         color=color, alpha=BAND_ALPHA, lw=0, zorder=2)
         ax.plot(xs, ys, lw=1.5, color=color, zorder=3)
-    if has_std:                                          # the no-interval ("std.") case
-        ystd, estd = mean(stride_accs[STRIDE_NONE]), sem(stride_accs[STRIDE_NONE])
-        if ks:
-            ax.plot([xs[-1], xstd], [ys[-1], ystd], ls=(0, (3, 2)), lw=1.2, color=color, zorder=2)
-        ax.axvline(kmax + 0.8, color='0.85', lw=0.8, zorder=0)   # separates std
-        if estd:                                         # SEM band around the detached point
-            ax.fill_between([xstd - 0.2, xstd + 0.2], ystd - estd, ystd + estd,
-                            color=color, alpha=BAND_ALPHA, lw=0, zorder=3)
-        ax.plot([xstd], [ystd], marker='D', ms=5.5, color=color, ls='none', zorder=4)
-    ax.set_xticks(ks + ([xstd] if has_std else []))
-    ax.set_xticklabels([str(k) for k in ks] + (['std.'] if has_std else []))
+    ax.set_xticks(ks)
+    ax.set_xticklabels([str(k) for k in ks])
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel('State-Emission Interval', fontsize=LABEL_FS)
     ax.set_ylabel('Final-Answer Accuracy', fontsize=LABEL_FS)

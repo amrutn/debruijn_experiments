@@ -94,7 +94,7 @@ CURVE_COLORS = ['#2a78d6', '#008300', '#e87ba4', '#eda100']   # blue, green, mag
 CURVE_MARKERS = ['o', 's', '^', 'D']
 LABEL_FS = 14
 TICK_FS = 12
-LEGEND_FS = 7
+LEGEND_FS = 8
 
 
 def _log_tick_fmt(v, _):
@@ -727,6 +727,31 @@ def _run_units(unit_fn, jobs, devices, force, desc='units'):
 	return results
 
 
+def _units_or_replot(name, jobs, unit_fn, devices, force, job_key, rec_key):
+	"""Return the unit results for a figure. If not `force` and the saved
+	figures/<name>.json already holds a result for every job the current profile
+	needs, reuse those (a pure re-plot: no unit dispatch, no per-unit cache needed --
+	handy for restyling from a machine that only has the committed figure JSON).
+	Otherwise dispatch the units as usual (which still reuse the per-unit cache)."""
+	path = os.path.join(FIG_DIR, name + '.json')
+	if not force and os.path.exists(path):
+		try:
+			with open(path) as f:
+				cached = json.load(f)
+			by_key = {}
+			for r in cached:
+				by_key.setdefault(rec_key(r), r)
+			wanted = [job_key(j) for j in jobs]
+			if all(k in by_key for k in wanted):
+				print(f"[{name}] reusing {len(wanted)} results from {name}.json "
+					  f"(re-plot only; pass --force to recompute)")
+				return [by_key[k] for k in wanted]
+		except (json.JSONDecodeError, KeyError, TypeError):
+			pass                                        # fall through to a real run
+	print(f"[{name}] {len(jobs)} units")
+	return _run_units(unit_fn, jobs, devices, force, desc=name)
+
+
 # ----------------------------------------------------------------------------
 # figure builders
 # ----------------------------------------------------------------------------
@@ -776,21 +801,15 @@ def _agg_over_seeds(group, key, drop_censored=False):
 
 def plot_samples_vs_edges(results, name, fit_plain_only=False):
 	"""
-	x = edges (distinct transitions the learner must acquire), y = samples to
-	reach a criterion, both averaged over the seeds (runs).
-	Both criteria are shown: illegal (blue) and coverage (green). Plain De Bruijn
-	DAGs are filled markers, position-permuted controls are hollow (their edge
-	count is inflated by the bucket width); error bars are +/- SEM over the seeds.
-	Within each graph a translucent line joins plain -> widest bucket -> ... ->
-	narrowest bucket. The dotted least-squares power-law fit per criterion is fit to
-	all points (plain and permuted), or to the plain points only when
-	`fit_plain_only` is set.
+	x = edges (distinct transitions the learner must acquire), y = samples to reach
+	a criterion, averaged over the seeds (runs). Only the plain (non-remapped) De
+	Bruijn points are shown, with a least-squares power-law fit per criterion:
+	illegal (blue) and coverage (green); error bars are +/- SEM over the seeds.
+	(`fit_plain_only` is retained for the call signature; every point here is plain.)
 	"""
-	fig, ax = plt.subplots(figsize=(3, 2.5))
-	# trajectory order: plain, then widest bucket down to narrowest (== increasing
-	# edge count, since a narrower bucket splits each edge across more positions)
-	bw_order = [None] + sorted({r['bin_width'] for r in results
-								if r['bin_width'] is not None}, reverse=True)
+	fig, ax = plt.subplots(figsize=(4, 2.5))
+	results = [r for r in results if r['bin_width'] is None]   # plain (non-remapped) points only
+	bw_order = [None]
 	graphs = []
 	for r in results:
 		g = (r['V'], r['n'])
@@ -846,17 +865,12 @@ def plot_samples_vs_edges(results, name, fit_plain_only=False):
 	ax.set_xlabel('Edges', fontsize=LABEL_FS)
 	ax.set_ylabel('Samples', fontsize=LABEL_FS)
 	_style_axis(ax)
-	crit = _legend(ax, [
+	_legend(ax, [
 		Line2D([], [], color=CURVE_COLORS[0], marker='o', ls='', ms=3.5, label=r'$P($invalid tokens$) < 0.05$'),
 		Line2D([], [], color=CURVE_COLORS[1], marker='o', ls='', ms=3.5, label=r'path coverage $> 0.95$'),
-	], loc='upper left')
-	ax.add_artist(crit)
-	_legend(ax, [
-		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, label='plain'),
-		Line2D([], [], color='0.35', marker='o', ls='', ms=3.5, mfc='none', label='remapped'),
 		Line2D([], [], color='0.35', ls='-', lw=1.6, label='fit'),
-	], loc='upper left', bbox=(0.0, 0.80))
-	# fit coefficients (all points) are recorded in the provenance, not here
+	], loc='upper left')
+	# fit coefficients are recorded in the provenance, not here
 	return _save(fig, name), fits
 
 
@@ -902,7 +916,7 @@ def plot_sample_efficiency_vs_edges(results, name, mincover):
 	log-scaled, y linear. Error bars combine the two SEMs by error propagation for a
 	ratio. No fits.
 	"""
-	fig, ax = plt.subplots(figsize=(3, 2.5))
+	fig, ax = plt.subplots(figsize=(4, 2.5))
 	bw_order = [None] + sorted({r['bin_width'] for r in results
 								if r['bin_width'] is not None}, reverse=True)
 	graphs = []
@@ -952,7 +966,7 @@ def plot_sample_efficiency_vs_edges(results, name, mincover):
 	if any_pts:
 		ax.set_xscale('log')                           # x log, y linear
 	ax.set_xlabel('Edges', fontsize=LABEL_FS)
-	ax.set_ylabel(rf'$P_{{\text{min}}}/$Samples', fontsize=LABEL_FS)
+	ax.set_ylabel(r'$P_{\text{min}}/$Samples', fontsize=LABEL_FS)
 	_style_axis(ax)
 	# both legends stacked at the top-left (criteria on top, plain/permuted below)
 	crit = _legend(ax, [
@@ -978,7 +992,7 @@ def plot_length_vs_Lmax(results, name):
 	fit -- comparing the training length needed against how far that model's
 	coverage actually reaches.
 	"""
-	fig, ax = plt.subplots(figsize=(3, 2.5))
+	fig, ax = plt.subplots(figsize=(4, 2.5))
 	graphs = []
 	for r in results:
 		g = (r['V'], r['n'])
@@ -1141,12 +1155,13 @@ def build_samples_vs_edges(profile, ordering, devices, force, name):
 			for g in profile['graphs']
 			for bw in profile['bin_widths']
 			for seed in profile['seeds']]
-	print(f"[{name}] {len(jobs)} units")
-	results = _run_units(samples_unit, jobs, devices, force, desc=name)
+	results = _units_or_replot(name, jobs, samples_unit, devices, force,
+							   job_key=lambda j: (j['graph'][0], j['graph'][1], j['bin_width'], j['seed']),
+							   rec_key=lambda r: (r['V'], r['n'], r['bin_width'], r['seed']))
 	os.makedirs(FIG_DIR, exist_ok=True)
 	with open(os.path.join(FIG_DIR, name + '.json'), 'w') as f:
 		json.dump(results, f, indent=1)
-	path, fits = plot_samples_vs_edges(results, name, fit_plain_only=False)
+	path, fits = plot_samples_vs_edges(results, name, fit_plain_only=True)
 	write_provenance(name, 'samples', profile, ordering, results, fits=fits)
 	print(f"[{name}] saved {path}.pdf/.png (+ {name}.json, {name}_provenance.json)")
 
@@ -1158,7 +1173,7 @@ def plot_samples_vs_edges_minimal(results, name):
 	(illegal blue, coverage green), log-log with a solid power-law fit. Standalone
 	(own labeled 'Samples' axis); there is no remapped control for this variant.
 	"""
-	fig, ax = plt.subplots(figsize=(3, 2.5))
+	fig, ax = plt.subplots(figsize=(4, 2.5))
 	graphs = []
 	for r in results:
 		g = (r['V'], r['n'])
@@ -1211,8 +1226,9 @@ def build_samples_vs_edges_minimal(profile, ordering, devices, force, name):
 	jobs = [dict(profile=profile, ordering=ordering, graph=tuple(g), seed=seed)
 			for g in profile['graphs']
 			for seed in profile['seeds']]
-	print(f"[{name}] {len(jobs)} units")
-	results = _run_units(samples_minimal_unit, jobs, devices, force, desc=name)
+	results = _units_or_replot(name, jobs, samples_minimal_unit, devices, force,
+							   job_key=lambda j: (j['graph'][0], j['graph'][1], j['seed']),
+							   rec_key=lambda r: (r['V'], r['n'], r['seed']))
 	os.makedirs(FIG_DIR, exist_ok=True)
 	with open(os.path.join(FIG_DIR, name + '.json'), 'w') as f:
 		json.dump(results, f, indent=1)
@@ -1237,14 +1253,111 @@ def build_sample_efficiency_vs_edges(profile, ordering, devices, force, name):
 	print(f"[{name}] saved {path}.pdf/.png (from {samples_name}.json, no retraining)")
 
 
+def plot_samples_vs_edges_remapped(results, name):
+	"""
+	Samples vs edges for the *remapped* (position-permuted) runs only, with the
+	power-law fit from the original (plain) points overlaid. x = edges (distinct
+	transitions), y = samples to reach a criterion; both log axes. For each graph the
+	three remapped intervals (bin_widths 16, 8, 4) are hollow markers -- one marker
+	shape per interval -- joined by a thin solid line (widest -> narrowest bucket),
+	with +/- SEM error bars over the seeds; color is the criterion (illegal blue,
+	coverage green). The light dashed line per criterion is the least-squares
+	power-law fit samples = c*edges^b fitted to the plain points (not shown here),
+	extended across the range -- if remapped runs obey the same law, their points lie
+	on it.
+	"""
+	graphs = []
+	for r in results:
+		g = (r['V'], r['n'])
+		if g not in graphs:
+			graphs.append(g)
+	rem_bw = sorted({r['bin_width'] for r in results if r['bin_width'] is not None}, reverse=True)  # 16, 8, 4
+	bw_marker = {bw: CURVE_MARKERS[i % len(CURVE_MARKERS)] for i, bw in enumerate(rem_bw)}  # o, s, ^
+
+	fig, ax = plt.subplots(figsize=(3, 2.5))
+	any_pts = False
+	fit_lines = []
+	for key, col in [('samples_illegal', CURVE_COLORS[0]), ('samples_coverage', CURVE_COLORS[1])]:
+		# power-law fit from the original (plain) points: samples = c * edges^b
+		fx, fy = [], []
+		for g in graphs:
+			grp = [r for r in results if (r['V'], r['n']) == g and r['bin_width'] is None]
+			a = _agg_over_seeds(grp, key, drop_censored=True) if grp else None
+			if a:
+				fx.append(float(np.mean([r['distinct_edges'] for r in grp])))
+				fy.append(a[0])
+		fit = _loglog_fit(fx, fy)
+		if fit:
+			fit_lines.append((fit, col))
+		# remapped points, one per (graph, bucket)
+		pts = {}
+		for g in graphs:
+			for bw in rem_bw:
+				grp = [r for r in results if (r['V'], r['n']) == g and r['bin_width'] == bw]
+				a = _agg_over_seeds(grp, key, drop_censored=True) if grp else None
+				if a:
+					edges = float(np.mean([r['distinct_edges'] for r in grp]))
+					pts[(g, bw)] = (edges,) + a
+		for g in graphs:                                # join a graph's intervals
+			traj = [pts[(g, bw)][:2] for bw in rem_bw if (g, bw) in pts]
+			if len(traj) >= 2:
+				ax.plot([t[0] for t in traj], [t[1] for t in traj],
+						ls='-', lw=0.8, color=col, alpha=0.7, zorder=1)
+		for (g, bw), (x, mean, sem, n) in pts.items():
+			any_pts = True
+			ax.errorbar(x, mean, yerr=sem, fmt=bw_marker[bw], ms=3.8, mew=1.0,
+						markerfacecolor='none', markeredgecolor=col,
+						ecolor=col, elinewidth=0.7, capsize=0, alpha=0.85, zorder=3)
+
+	if any_pts:
+		ax.set_xscale('log')
+		ax.set_yscale('log')
+	xlim = ax.get_xlim()
+	gx_full = np.array(xlim)
+	for (b, c), col in fit_lines:                       # plain-point fit lines, extended
+		ax.plot(gx_full, c * gx_full ** b, ls='--', lw=1.2, color=col, alpha=0.55, zorder=0)
+	ax.set_xlim(xlim)
+	ax.set_xlabel('Edges', fontsize=LABEL_FS)
+	ax.set_ylabel('Samples', fontsize=LABEL_FS)
+	_style_axis(ax)
+	from matplotlib.patches import Patch
+	# color = criterion, plus the fit style (upper left); marker shape = interval (lower right)
+	crit = _legend(ax, [
+		Patch(facecolor=CURVE_COLORS[0], edgecolor='none', label=r'$P($invalid tokens$) < 0.05$'),
+		Patch(facecolor=CURVE_COLORS[1], edgecolor='none', label=r'path coverage $> 0.95$'),
+		Line2D([], [], color='0.35', ls='--', lw=1.2, alpha=0.7, label='fit (not remapped)'),
+	], loc='upper left')
+	ax.add_artist(crit)
+	_legend(ax, [Line2D([], [], color='0.35', marker=bw_marker[bw], ls='', mfc='none', ms=3.5,
+						label=f'$s$={bw}') for bw in rem_bw],
+			loc='lower right')
+	return _save(fig, name)
+
+
+def build_samples_vs_edges_remapped(profile, ordering, devices, force, name):
+	"""Reuse the cached samples_vs_edges results (no retraining) and plot samples vs
+	edges for the remapped runs, with the power-law fit from the plain points overlaid.
+	Reads the samples figure JSON produced by build_samples_vs_edges for the same ordering."""
+	samples_name = 'samples_vs_edges' + ('_digit_sum' if ordering == 'digit_sum' else '')
+	src = os.path.join(FIG_DIR, samples_name + '.json')
+	if not os.path.exists(src):
+		raise FileNotFoundError(f"{src} not found -- build {samples_name} first "
+								f"(this plot reuses its results, it does not retrain)")
+	with open(src) as f:
+		results = json.load(f)
+	path = plot_samples_vs_edges_remapped(results, name)
+	print(f"[{name}] saved {path}.pdf/.png (from {samples_name}.json, no retraining)")
+
+
 def build_length_vs_Lmax(profile, ordering, devices, force, name, windowed=False,
 						 augmented=False, hint_index=0):
 	jobs = [dict(profile=profile, ordering=ordering, graph=tuple(g), seed=seed,
 				 windowed=windowed, augmented=augmented)
 			for g in profile['graphs']
 			for seed in profile['seeds']]
-	print(f"[{name}] {len(jobs)} units")
-	results = _run_units(length_unit, jobs, devices, force, desc=name)
+	results = _units_or_replot(name, jobs, length_unit, devices, force,
+							   job_key=lambda j: (j['graph'][0], j['graph'][1], j['seed']),
+							   rec_key=lambda r: (r['V'], r['n'], r['seed']))
 	os.makedirs(FIG_DIR, exist_ok=True)
 	with open(os.path.join(FIG_DIR, name + '.json'), 'w') as f:
 		json.dump(results, f, indent=1)
@@ -1264,9 +1377,12 @@ FIGURES = {
 	'samples_vs_edges': lambda p, d, f: build_samples_vs_edges(p, 'random', d, f, 'samples_vs_edges'),
 	# sample efficiency = min-edge-cover paths / samples; reuses samples_vs_edges results (no retrain)
 	'sample_efficiency_vs_edges': lambda p, d, f: build_sample_efficiency_vs_edges(p, 'random', d, f, 'sample_efficiency_vs_edges'),
+	# samples vs edges for the remapped runs, with the plain-point fit overlaid; reuses samples_vs_edges results
+	'samples_vs_edges_remapped': lambda p, d, f: build_samples_vs_edges_remapped(p, 'random', d, f, 'samples_vs_edges_remapped'),
 	'length_vs_Lmax': lambda p, d, f: build_length_vs_Lmax(p, 'random', d, f, 'length_vs_Lmax'),
 	'samples_vs_edges_digit_sum': lambda p, d, f: build_samples_vs_edges(p, 'digit_sum', d, f, 'samples_vs_edges_digit_sum'),
 	'sample_efficiency_vs_edges_digit_sum': lambda p, d, f: build_sample_efficiency_vs_edges(p, 'digit_sum', d, f, 'sample_efficiency_vs_edges_digit_sum'),
+	'samples_vs_edges_remapped_digit_sum': lambda p, d, f: build_samples_vs_edges_remapped(p, 'digit_sum', d, f, 'samples_vs_edges_remapped_digit_sum'),
 	'length_vs_Lmax_digit_sum': lambda p, d, f: build_length_vs_Lmax(p, 'digit_sum', d, f, 'length_vs_Lmax_digit_sum'),
 	# windowed (local) attention: length generalisation with a sliding window of width n
 	'length_vs_Lmax_windowed': lambda p, d, f: build_length_vs_Lmax(p, 'random', d, f, 'length_vs_Lmax_windowed', windowed=True),

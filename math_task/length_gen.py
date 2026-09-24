@@ -152,25 +152,33 @@ def _long_mix(target):
     return out
 
 
-def long_problems(target, n=N_PER_LENGTH, seed=LONG_SEED, progress=True):
+def _gen_seed(target, seed):
+    """Generation seed for a (length, experiment-seed) pair -- distinct for each."""
+    return LONG_SEED + target + 1000 * seed
+
+
+def long_problems(target, seed=0, n=N_PER_LENGTH, progress=True):
     """
-    `n` problems whose canonical solution is exactly `target` operations.
+    `n` problems whose canonical solution is exactly `target` operations, for one
+    experiment `seed` (its own independent draw).
 
     Cached in the same directory as the ordinary datasets but under a key that
-    carries the target length and this module's mix, so it can never collide with
-    a cached train or test split.
+    carries the target length, the seed and this module's mix, so it can never
+    collide with a cached train or test split, or with another seed's set.
     """
+    gen_seed = _gen_seed(target, seed)
     # the generator version rides along so a change to `generate_data`
-    # invalidates these sets exactly as it invalidates the ordinary ones
-    spec = dict(split='length-gen', n=n, seed=seed + target, target_ops=target,
+    # invalidates these sets exactly as it invalidates the ordinary ones. The
+    # per-seed offset is folded into `gen_seed`, so seed 0 keeps its original key.
+    spec = dict(split='length-gen', n=n, seed=gen_seed, target_ops=target,
                 gen_version=R.DATA.gen_version, mix=_long_mix(target))
     path = os.path.join(DATA_CACHE, _key(spec) + '.json')
     if os.path.exists(path):
         with open(path) as f:
             return [Problem.from_dict(d) for d in json.load(f)]
     print(f'generating {n} problems of exactly {target} operations '
-          f'(rejection-sampled, this is slow) ...', flush=True)
-    probs = make_dataset(n, seed=seed + target, min_ops=target, max_ops=target,
+          f'(seed {seed}, rejection-sampled, this is slow) ...', flush=True)
+    probs = make_dataset(n, seed=gen_seed, min_ops=target, max_ops=target,
                          mix=_long_mix(target), progress=progress)
     os.makedirs(DATA_CACHE, exist_ok=True)
     tmp = path + f'.tmp{os.getpid()}'
@@ -180,17 +188,17 @@ def long_problems(target, n=N_PER_LENGTH, seed=LONG_SEED, progress=True):
     return probs
 
 
-def _eval_cfg(target):
+def _eval_cfg(target, seed):
     """
-    The DataConfig used to key long-eval decodes -- never to train or to look up
-    an adapter.
+    The DataConfig used to key long-eval decodes for one (length, seed) -- never to
+    train or to look up an adapter.
 
-    It differs from `DATA` in the test fields only, which is what makes the decode
-    cache entry distinct; `test_seed` carries the length so two lengths can never
-    share a key even if the op filters were to coincide.
+    `train_seed` ties the decode to that seed's adapter/train split; the test fields
+    (length + a per-(length, seed) `test_seed`) make each length and seed a distinct
+    decode cache entry.
     """
-    return replace(R.DATA, n_test=N_PER_LENGTH, min_ops=target, max_ops=target,
-                   test_seed=LONG_SEED + target)
+    return replace(R.DATA, train_seed=seed, n_test=N_PER_LENGTH,
+                   min_ops=target, max_ops=target, test_seed=_gen_seed(target, seed))
 
 
 def _sem(p, n):
@@ -218,32 +226,34 @@ def score(problems, records):
     return acc, der, _sem(acc, n), _sem(der, n)
 
 
-def is_cached(k, L, mode):
-    """True if this (condition, length) has already been decoded."""
-    return os.path.exists(_decode_path(k, 0.0, _eval_cfg(L), R.MODEL,
-                                       R.train_cfg(k, mode), R.EVAL))
+def is_cached(k, L, mode, seed):
+    """True if this (condition, length, seed) has already been decoded."""
+    return os.path.exists(_decode_path(k, 0.0, _eval_cfg(L, seed), R.MODEL,
+                                       R.train_cfg(k, mode, seed), R.eval_cfg(seed)))
 
 
-def _length_jobs(conds, lengths, mode, device, force, decode, progress_pos=0,
+def _length_jobs(units, lengths, mode, device, force, decode, progress_pos=0,
                  log=print):
     """
-    Score every (condition, length) on one device, sequentially.
+    Score every ``(condition, seed)`` unit across `lengths`, sequentially.
 
-    One condition is one task: the adapter is loaded once and kept resident
-    across all of its lengths, because reloading the base model per length would
+    One (condition, seed) is one task: that seed's adapter is loaded once and kept
+    resident across all lengths, because reloading the base model per length would
     cost far more than any imbalance it could save.
     """
     rows = []
-    todo = [(k, L) for k in conds for L in lengths
-            if force or not is_cached(k, L, mode)]
+    todo = [(k, s, L) for (k, s) in units for L in lengths
+            if force or not is_cached(k, L, mode, s)]
 
-    for k in conds:
-        need = [L for L in lengths if (k, L) in todo] if decode else []
+    for k, s in units:
+        TR = R.train_cfg(k, mode, s)
+        ecfg = R.eval_cfg(s)
+        need = [L for L in lengths if (k, s, L) in todo] if decode else []
         pack = {}
 
         # the adapter is only resolved when something actually has to be decoded,
         # so a fully cached run never trains, loads a model or touches the GPU
-        def get_model(_k=k):
+        def get_model(_k=k, _s=s, _TR=TR):
             # `decode=False` promises no model is loaded. `get_or_decode` can
             # still reach for one if a cached decode turns out to be unreadable
             # or the wrong length, so make that a loud failure rather than a
@@ -251,24 +261,21 @@ def _length_jobs(conds, lengths, mode, device, force, decode, progress_pos=0,
             if not decode:
                 raise RuntimeError(
                     f'length_results(decode=False) needed to decode '
-                    f'k={R._cond_label(_k)}: its cached decode is unusable. '
-                    f'Re-run with decode=True to rebuild it.')
+                    f'k={R._cond_label(_k)} seed={_s}: its cached decode is '
+                    f'unusable. Re-run with decode=True to rebuild it.')
             if 'p' not in pack:
-                # ORIGINAL data config: this resolves to the already trained
-                # adapter. Passing the long-eval config would change the adapter
-                # key -- `_ADAPTER_KEY_TEST` pins only n_test and test_seed, not
-                # min_ops/max_ops -- and silently retrain every condition.
-                adapter = train_adapter(_k, R.data_cfg(mode), R.MODEL,
-                                        R.train_cfg(_k, mode), device=device,
+                # that seed's training split resolves to its already trained
+                # adapter; the long-eval config is only for decode keys.
+                adapter = train_adapter(_k, R.data_cfg(_s), R.MODEL, _TR,
+                                        device=device,
                                         log=lambda m: log(f'[{mode}] {m}'))
-                pack['p'] = load_for_eval(adapter, R.MODEL,
-                                          R.train_cfg(_k, mode), device=device)
+                pack['p'] = load_for_eval(adapter, R.MODEL, _TR, device=device)
             return pack['p']
 
         for L in lengths:
-            if not (is_cached(k, L, mode) or L in need):
+            if not (is_cached(k, L, mode, s) or L in need):
                 continue
-            probs = long_problems(L)
+            probs = long_problems(L, s)
             # A long trace at the eval batch on a shared GPU can OOM. Rather than
             # skip the unit (which would leave a hole in the figure), retry it at
             # a halved batch until it fits. `batch_override` keeps the decode keyed
@@ -278,12 +285,12 @@ def _length_jobs(conds, lengths, mode, device, force, decode, progress_pos=0,
             while True:
                 try:
                     _, records = get_or_decode(
-                        get_model, probs, k, 0.0, _eval_cfg(L), R.MODEL,
-                        R.train_cfg(k, mode), R.EVAL, device=device,
+                        get_model, probs, k, 0.0, _eval_cfg(L, s), R.MODEL,
+                        TR, ecfg, device=device,
                         # never force in a cache-only pass: forcing would re-decode
                         # every cached unit and defeat `decode=False`
                         force=force and decode,
-                        desc=f'{R._cond_label(k)} len={L} decode', log=log,
+                        desc=f'{R._cond_label(k)} len={L} seed={s} decode', log=log,
                         progress_pos=progress_pos,
                         batch_override=None if batch == R.EVAL.batch_size else batch)
                     break
@@ -291,14 +298,13 @@ def _length_jobs(conds, lengths, mode, device, force, decode, progress_pos=0,
                     if _is_oom(e) and batch > 1:
                         _empty_cuda()
                         batch = max(1, batch // 2)
-                        log(f'  [length] OOM on k={R._cond_label(k)} len={L}; '
-                            f'retrying at batch {batch}')
+                        log(f'  [length] OOM on k={R._cond_label(k)} len={L} '
+                            f'seed={s}; retrying at batch {batch}')
                         continue
                     raise
-            acc, der, acc_sem, der_sem = score(probs, records)
-            rows.append(dict(cond=k, length=L, n=len(probs), mode=mode,
-                             accuracy=acc, derivation=der,
-                             accuracy_sem=acc_sem, derivation_sem=der_sem))
+            acc, der, _, _ = score(probs, records)
+            rows.append(dict(cond=k, length=L, seed=s, n=len(probs), mode=mode,
+                             accuracy=acc, derivation=der))
         if pack:
             pack.clear()
             try:
@@ -313,15 +319,16 @@ _STOP = '__stop__'      # queue sentinel; None is a real condition (standard)
 
 
 def _length_worker(queue, lengths, mode, device, force, decode, progress_pos):
-    """Pull conditions off the shared queue until it is drained."""
+    """Pull ``(condition, seed)`` units off the shared queue until it is drained."""
     out = []
     while True:
-        k = queue.get()
-        if k == _STOP:
+        item = queue.get()
+        if item == _STOP:
             break
-        print(f'[{device}] starting {mode} length-gen k={R._cond_label(k)}',
+        k, s = item
+        print(f'[{device}] starting {mode} length-gen k={R._cond_label(k)} seed={s}',
               flush=True)
-        out.extend(_length_jobs([k], lengths, mode, device, force, decode,
+        out.extend(_length_jobs([(k, s)], lengths, mode, device, force, decode,
                                 progress_pos))
     print(f'[{device}] length-gen done', flush=True)
     return out
@@ -361,29 +368,31 @@ def length_results(mode='samples', conds=None, lengths=LENGTHS, devices=('cuda',
     conds = list(CONDS if conds is None else conds)
     lengths = tuple(lengths)
     devices = [devices] if isinstance(devices, str) else list(devices)
+    units = [(k, s) for s in R.SEEDS for k in conds]
 
-    todo = [(k, L) for k in conds for L in lengths
-            if force or not is_cached(k, L, mode)]
+    todo = [(k, s, L) for (k, s) in units for L in lengths
+            if force or not is_cached(k, L, mode, s)]
     if todo and not decode:
         log(f'  [length] {len(todo)} unit(s) not cached; skipping them '
             f'(no model is loaded when decode=False)')
     if not todo or not decode or len(devices) == 1:
         # nothing to decode, or a cache-only pass, or one device: no point paying
         # for processes
-        return _length_jobs(conds, lengths, mode, devices[0], force, decode,
+        return _length_jobs(units, lengths, mode, devices[0], force, decode,
                             log=log)
 
-    # Generate (and cache) every long problem set HERE, in the parent. Each
-    # worker calls `long_problems`, so without this every GPU would redo the same
-    # rejection-sampled SymPy generation concurrently.
-    for L in lengths:
-        long_problems(L)
+    # Generate (and cache) every long problem set (all seeds) HERE, in the parent.
+    # Each worker calls `long_problems`, so without this every GPU would redo the
+    # same rejection-sampled SymPy generation concurrently.
+    for s in R.SEEDS:
+        for L in lengths:
+            long_problems(L, s)
 
     ctx = mp.get_context('spawn')
     manager = ctx.Manager()
     queue = manager.Queue()
-    for k in conds:
-        queue.put(k)
+    for unit in units:
+        queue.put(unit)
     for _ in devices:
         queue.put(_STOP)
 
@@ -412,8 +421,13 @@ def print_length_gen(rows, mode):
     lengths = sorted({r['length'] for r in rows})
     conds = [k for k in CONDS
              if any(r['cond'] == k for r in rows)]
-    by = {(r['cond'], r['length']): r for r in rows}
-    print(f'\n=== length generalisation [{mode}, clean decodes] ===')
+
+    def cell(k, L, field):
+        m, _ = R._mean_sem([r[field] for r in rows
+                            if r['cond'] == k and r['length'] == L])
+        return m
+
+    print(f'\n=== length generalisation [{mode}, clean decodes, mean over seeds] ===')
     print(f'  training problems ran {R.DATA.min_ops}-{R.DATA.max_ops} operations;'
           f' lengths past {R.DATA.max_ops} are extrapolation')
     print('  acc = final answer correct;  der = written operations derive it\n')
@@ -422,9 +436,9 @@ def print_length_gen(rows, mode):
     for k in conds:
         cells = []
         for L in lengths:
-            r = by.get((k, L))
-            cells.append('    -       -' if r is None
-                         else f"{r['accuracy']:6.3f}  {r['derivation']:6.3f}")
+            a, d = cell(k, L, 'accuracy'), cell(k, L, 'derivation')
+            cells.append('    -       -' if a is None
+                         else f"{a:6.3f}  {d:6.3f}")
         print(f'  {R._cond_label(k):>4}  ' + '  '.join(cells))
 
 
@@ -469,32 +483,43 @@ def _plot(rows, mode, subdir=''):
     lengths = sorted({r['length'] for r in rows})
     if not lengths or (not ks and not has_std):
         return None
-    by = {(r['cond'], r['length']): r for r in rows}
     colors = _ramp_colors(ks, has_std)
+
+    def stat(cond, L, field):
+        return R._mean_sem([r[field] for r in rows
+                            if r['cond'] == cond and r['length'] == L])
 
     fig, ax = plt.subplots(figsize=(3, 2.5))
     ax.axvline(R.DATA.max_ops, color='0.8', lw=1.0, zorder=0)   # training ends here
     series = [(k, colors[k], rf'$k={k}$') for k in ks]
     if has_std:
-        series.append((None, colors[None], 'std.'))
+        series.append((None, colors[None], r'$k=\infty$'))
     handles = []
     for cond, col, label in series:
-        xs = [L for L in lengths if (cond, L) in by]
+        xs = [L for L in lengths
+              if any(r['cond'] == cond and r['length'] == L for r in rows)]
         if not xs:
             continue
-        ax.plot(xs, [by[(cond, L)]['accuracy'] for L in xs],
-                marker='o', ms=4.0, lw=1.5, color=col, zorder=2)
-        ax.plot(xs, [by[(cond, L)]['derivation'] for L in xs],
-                marker='D', ms=3.6, lw=1.3, ls=(0, (3, 2)), color=col, zorder=2)
+        am = [stat(cond, L, 'accuracy') for L in xs]
+        dm = [stat(cond, L, 'derivation') for L in xs]
+        ax.errorbar(xs, [m for m, _ in am], yerr=[e for _, e in am],
+                    marker='o', ms=4.0, lw=1.5, color=col, capsize=2,
+                    elinewidth=0.9, zorder=2)
+        ax.errorbar(xs, [m for m, _ in dm], yerr=[e for _, e in dm], marker='D',
+                    ms=3.6, lw=1.3, ls=(0, (3, 2)), color=col, capsize=2,
+                    elinewidth=0.9, zorder=2)
         handles.append(Line2D([], [], color=col, marker='o', ms=4, lw=1.5,
                               label=label))
-    # no-reasoning baseline: a single black test-accuracy line (no ops => no
+    # no-reasoning baseline: a single black final-answer line (no ops => no
     # derivation to score, so no dashed twin)
     if has_nocot:
-        xs = [L for L in lengths if (NO_COT, L) in by]
+        xs = [L for L in lengths
+              if any(r['cond'] == NO_COT and r['length'] == L for r in rows)]
         if xs:
-            ax.plot(xs, [by[(NO_COT, L)]['accuracy'] for L in xs],
-                    marker='o', ms=4.0, lw=1.5, color='black', zorder=2)
+            nm = [stat(NO_COT, L, 'accuracy') for L in xs]
+            ax.errorbar(xs, [m for m, _ in nm], yerr=[e for _, e in nm],
+                        marker='o', ms=4.0, lw=1.5, color='black', capsize=2,
+                        elinewidth=0.9, zorder=2)
             handles.append(Line2D([], [], color='black', marker='o', ms=4, lw=1.5,
                                   label='no reasoning'))
     ax.set_ylim(-0.02, 1.02)
