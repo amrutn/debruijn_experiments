@@ -1,6 +1,7 @@
 *reproducibility*
 logs/
 __pycache__/
+stdout
 cache/
 figures/
 entropy_traces/
